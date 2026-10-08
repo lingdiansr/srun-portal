@@ -210,11 +210,7 @@ pub struct Challenge {
 
 /// `username, ip, callback` (SPEC §4).
 fn get_challenge_pairs(username: &str, ip: &str, callback: &str) -> Vec<(String, String)> {
-    pairs(&[
-        ("username", username),
-        ("ip", ip),
-        ("callback", callback),
-    ])
+    pairs(&[("username", username), ("ip", ip), ("callback", callback)])
 }
 
 /// Read `expire` when it is a number; a non-integral or negative value is
@@ -609,11 +605,7 @@ pub fn get_phone_sign(ep: &Endpoints, params: &[(&str, &str)]) -> Result<PhoneSi
 /// it records neither the parameter set nor their order, so this
 /// implementation sends the one argument it is given, followed by `callback`,
 /// and leaves the `error` check to the caller.
-pub fn send_visitor_vcode(
-    ep: &Endpoints,
-    phone: &str,
-    callback: &str,
-) -> Result<Value, ApiError> {
+pub fn send_visitor_vcode(ep: &Endpoints, phone: &str, callback: &str) -> Result<Value, ApiError> {
     jsonp_get(
         ep,
         SRUNMOBILE_PORTAL_PATH,
@@ -755,7 +747,10 @@ mod tests {
         assert_eq!(names(&req.pairs), LOGIN_NAMES);
         assert_eq!(value_of(&req, "action"), "login");
         assert_eq!(value_of(&req, "username"), "testuser");
-        assert_eq!(value_of(&req, "password"), "{MD5}94401f94e5f4eecf2f52ef15389fc664");
+        assert_eq!(
+            value_of(&req, "password"),
+            "{MD5}94401f94e5f4eecf2f52ef15389fc664"
+        );
         assert_eq!(value_of(&req, "os"), "Linux");
         assert_eq!(value_of(&req, "name"), "linux");
         assert_eq!(value_of(&req, "ac_id"), "1");
@@ -797,9 +792,18 @@ mod tests {
 
     #[test]
     fn double_stack_follows_enable_and_other_stack() {
-        assert_eq!(value_of(&build_login(&params(false, true, false)), "double_stack"), "0");
-        assert_eq!(value_of(&build_login(&params(false, true, true)), "double_stack"), "1");
-        assert_eq!(value_of(&build_login(&params(false, false, true)), "double_stack"), "0");
+        assert_eq!(
+            value_of(&build_login(&params(false, true, false)), "double_stack"),
+            "0"
+        );
+        assert_eq!(
+            value_of(&build_login(&params(false, true, true)), "double_stack"),
+            "1"
+        );
+        assert_eq!(
+            value_of(&build_login(&params(false, false, true)), "double_stack"),
+            "0"
+        );
     }
 
     // -- 4. OTP mode (SPEC §7.4) --------------------------------------------
@@ -818,7 +822,10 @@ mod tests {
     #[test]
     fn logout_pairs_and_notice_url() {
         let ordered = logout_pairs("testuser@szu.edu.cn", "10.9.9.9", "12", DEFAULT_CALLBACK);
-        assert_eq!(names(&ordered), ["action", "username", "ip", "ac_id", "callback"]);
+        assert_eq!(
+            names(&ordered),
+            ["action", "username", "ip", "ac_id", "callback"]
+        );
         assert_eq!(ordered[0].1, "logout");
         assert_eq!(ordered[1].1, "testuser@szu.edu.cn");
         assert_eq!(ordered[2].1, "10.9.9.9");
@@ -900,7 +907,8 @@ mod tests {
             "GET /cgi-bin/rad_user_info?callback=jsonp HTTP/1.1"
         );
 
-        let own = rad_user_info(&ep, Some("10.9.9.9"), false, DEFAULT_CALLBACK).expect("check parses");
+        let own =
+            rad_user_info(&ep, Some("10.9.9.9"), false, DEFAULT_CALLBACK).expect("check parses");
         assert_eq!(own["online_ip"], "10.9.9.9");
         assert_eq!(
             stub.next_request(),

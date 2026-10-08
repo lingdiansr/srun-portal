@@ -59,7 +59,10 @@ fn password_field_matches_capture() {
 
 #[test]
 fn info_field_matches_capture() {
-    assert_eq!(encode_user_info(USERNAME, PASSWORD, IP, ACID, TOKEN), CAPTURED_INFO);
+    assert_eq!(
+        encode_user_info(USERNAME, PASSWORD, IP, ACID, TOKEN),
+        CAPTURED_INFO
+    );
 }
 
 #[test]
@@ -121,8 +124,14 @@ fn config_page_query_is_byte_identical() {
 fn jsonp_bodies_escape_the_way_urlsearchparams_does() {
     // The captured login query is the oracle for the escaping of the payload.
     let escaped_info = urlencode(CAPTURED_INFO);
-    assert!(CAPTURED_LOGIN_QUERY.contains(&escaped_info), "{escaped_info}");
-    assert_eq!(urlencode(&format!("{{MD5}}{CAPTURED_PASSWORD}")), "%7BMD5%7D94401f94e5f4eecf2f52ef15389fc664");
+    assert!(
+        CAPTURED_LOGIN_QUERY.contains(&escaped_info),
+        "{escaped_info}"
+    );
+    assert_eq!(
+        urlencode(&format!("{{MD5}}{CAPTURED_PASSWORD}")),
+        "%7BMD5%7D94401f94e5f4eecf2f52ef15389fc664"
+    );
 }
 
 #[test]
@@ -135,8 +144,15 @@ fn variant_base64_matches_standard_base64() {
         b"\x00\x01\x02\xfe\xffabc",
         b"the quick brown fox jumps over the lazy dog",
     ] {
-        assert_eq!(btoa(probe, STANDARD_ALPHABET), reference_base64(probe), "probe {probe:?}");
-        assert_eq!(atob(&btoa(probe, STANDARD_ALPHABET), STANDARD_ALPHABET).unwrap(), probe);
+        assert_eq!(
+            btoa(probe, STANDARD_ALPHABET),
+            reference_base64(probe),
+            "probe {probe:?}"
+        );
+        assert_eq!(
+            atob(&btoa(probe, STANDARD_ALPHABET), STANDARD_ALPHABET).unwrap(),
+            probe
+        );
         let srun = btoa(probe, SRUN_ALPHABET);
         assert_eq!(atob(&srun, SRUN_ALPHABET).unwrap(), probe);
         assert_eq!(srun.len(), std_base64_len(probe));
@@ -171,12 +187,24 @@ fn reference_base64(input: &[u8]) -> String {
     const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::new();
     for chunk in input.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
         out.push(TABLE[(n >> 18) as usize & 63] as char);
         out.push(TABLE[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 { TABLE[(n >> 6) as usize & 63] as char } else { '=' });
-        out.push(if chunk.len() > 2 { TABLE[n as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            TABLE[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[n as usize & 63] as char
+        } else {
+            '='
+        });
     }
     out
 }

@@ -48,7 +48,10 @@ impl Translate {
     }
 
     /// A translator for `lang` over a pre-built catalogue.
-    pub fn with_dictionary(lang: &str, dictionary: HashMap<String, HashMap<String, String>>) -> Self {
+    pub fn with_dictionary(
+        lang: &str,
+        dictionary: HashMap<String, HashMap<String, String>>,
+    ) -> Self {
         Self {
             lang: lang.to_string(),
             dictionary,
@@ -380,7 +383,10 @@ mod tests {
     #[test]
     fn message_format_applies_the_separator_and_dot_rules() {
         assert_eq!(message_format("Login success."), "LoginSuccess");
-        assert_eq!(message_format("ip_already_online_error"), "IpAlreadyOnlineError");
+        assert_eq!(
+            message_format("ip_already_online_error"),
+            "IpAlreadyOnlineError"
+        );
         assert_eq!(message_format("a b"), "AB");
         assert_eq!(message_format("Please, try again"), "PleaseTryAgain");
         // Already-camel text keeps its first character upper-cased only.
@@ -417,17 +423,23 @@ mod tests {
         );
         // …unless it is an empty or E0000 placeholder.
         assert_eq!(
-            t.translate_error(&json!({"ploy_msg": "", "ecode": "E2901", "error_msg": "Login success."})),
+            t.translate_error(
+                &json!({"ploy_msg": "", "ecode": "E2901", "error_msg": "Login success."})
+            ),
             "logged in"
         );
         assert_eq!(
-            t.translate_error(&json!({"ploy_msg": "E0000", "ecode": "E2901", "error_msg": "Login success."})),
+            t.translate_error(
+                &json!({"ploy_msg": "E0000", "ecode": "E2901", "error_msg": "Login success."})
+            ),
             "logged in"
         );
 
         // 2. E2901 reports error_msg.
         assert_eq!(
-            t.translate_error(&json!({"ecode": "E2901", "error_msg": "Login success.", "error": "ok"})),
+            t.translate_error(
+                &json!({"ecode": "E2901", "error_msg": "Login success.", "error": "ok"})
+            ),
             "logged in"
         );
 
@@ -440,10 +452,16 @@ mod tests {
         assert_eq!(t.translate_error(&json!({"ecode": "E2903"})), "E2903");
 
         // 4. error_msg.
-        assert_eq!(t.translate_error(&json!({"error_msg": "Login success."})), "logged in");
+        assert_eq!(
+            t.translate_error(&json!({"error_msg": "Login success."})),
+            "logged in"
+        );
 
         // 5. error, with the identity fallback when nothing is registered.
-        assert_eq!(t.translate_error(&json!({"error": "Login success."})), "logged in");
+        assert_eq!(
+            t.translate_error(&json!({"error": "Login success."})),
+            "logged in"
+        );
         assert_eq!(t.translate_error(&json!({"error": "ok"})), "ok");
         assert_eq!(t.translate_error(&json!({})), "");
     }
@@ -453,23 +471,34 @@ mod tests {
         let t = translator();
 
         // code === 0 → dictionary "Success", literal when absent.
-        assert_eq!(t.translate_code(&json!({"code": 0})).as_deref(), Some("OK!"));
         assert_eq!(
-            Translate::new("en-US").translate_code(&json!({"code": 0})).as_deref(),
+            t.translate_code(&json!({"code": 0})).as_deref(),
+            Some("OK!")
+        );
+        assert_eq!(
+            Translate::new("en-US")
+                .translate_code(&json!({"code": 0}))
+                .as_deref(),
             Some("Success")
         );
         // code === 1 → the reference returns undefined.
         assert_eq!(t.translate_code(&json!({"code": 1})), None);
         // anything else → dictionary "Error", literal when absent.
-        assert_eq!(t.translate_code(&json!({"code": 2})).as_deref(), Some("bad"));
         assert_eq!(
-            Translate::new("en-US").translate_code(&json!({"code": 2})).as_deref(),
+            t.translate_code(&json!({"code": 2})).as_deref(),
+            Some("bad")
+        );
+        assert_eq!(
+            Translate::new("en-US")
+                .translate_code(&json!({"code": 2}))
+                .as_deref(),
             Some("Error")
         );
 
         // ploy_msg and message short-circuit the code switch.
         assert_eq!(
-            t.translate_code(&json!({"code": 1, "ploy_msg": "Login success."})).as_deref(),
+            t.translate_code(&json!({"code": 1, "ploy_msg": "Login success."}))
+                .as_deref(),
             Some("logged in")
         );
         assert_eq!(
@@ -478,12 +507,18 @@ mod tests {
             Some("logged in")
         );
         assert_eq!(
-            t.translate_code(&json!({"code": 0, "message": "Login success."})).as_deref(),
+            t.translate_code(&json!({"code": 0, "message": "Login success."}))
+                .as_deref(),
             Some("logged in")
         );
 
         // An unknown language is a miss, never a panic.
-        assert_eq!(Translate::new("fr-FR").translate_code(&json!({"code": 0})).as_deref(), Some("Success"));
+        assert_eq!(
+            Translate::new("fr-FR")
+                .translate_code(&json!({"code": 0}))
+                .as_deref(),
+            Some("Success")
+        );
     }
 
     #[test]

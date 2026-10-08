@@ -166,9 +166,10 @@ mod imp {
             .spawn()
             .map_err(|err| format!("{} failed: {err}", argv.join(" ")))?;
         if let Some(bytes) = stdin {
-            let mut handle = child.stdin.take().ok_or_else(|| {
-                format!("{}: stdin was not available", argv.join(" "))
-            })?;
+            let mut handle = child
+                .stdin
+                .take()
+                .ok_or_else(|| format!("{}: stdin was not available", argv.join(" ")))?;
             handle
                 .write_all(bytes)
                 .map_err(|err| format!("{} failed: {err}", argv.join(" ")))?;
@@ -297,9 +298,9 @@ mod imp {
             .chunks_exact(2)
             .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
             .collect();
-        String::from_utf16(&units)
-            .map(Some)
-            .map_err(|err| format!("the stored credential for {account} is not valid UTF-16: {err}"))
+        String::from_utf16(&units).map(Some).map_err(|err| {
+            format!("the stored credential for {account} is not valid UTF-16: {err}")
+        })
     }
 
     pub fn store(account: &str, password: &str) -> Result<(), String> {
@@ -507,7 +508,14 @@ mod tests {
 
         assert_eq!(
             lookup_argv("testuser"),
-            vec!["secret-tool", "lookup", "service", "srun-portal", "account", "testuser"]
+            vec![
+                "secret-tool",
+                "lookup",
+                "service",
+                "srun-portal",
+                "account",
+                "testuser"
+            ]
         );
         assert_eq!(
             store_argv("testuser"),
@@ -524,7 +532,14 @@ mod tests {
         );
         assert_eq!(
             delete_argv("testuser"),
-            vec!["secret-tool", "clear", "service", "srun-portal", "account", "testuser"]
+            vec![
+                "secret-tool",
+                "clear",
+                "service",
+                "srun-portal",
+                "account",
+                "testuser"
+            ]
         );
     }
 
@@ -542,7 +557,10 @@ mod tests {
         assert_eq!(read(&account).unwrap(), None, "nothing stored yet");
 
         store(&account, "p@ss word \"quoted\"").unwrap();
-        assert_eq!(read(&account).unwrap().as_deref(), Some("p@ss word \"quoted\""));
+        assert_eq!(
+            read(&account).unwrap().as_deref(),
+            Some("p@ss word \"quoted\"")
+        );
 
         // A second store replaces rather than duplicating.
         store(&account, "second").unwrap();

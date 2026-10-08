@@ -158,7 +158,11 @@ impl Settings {
     }
 }
 
-fn optional_string(table: &toml::Table, key: &str, path: &Path) -> Result<Option<String>, ConfigError> {
+fn optional_string(
+    table: &toml::Table,
+    key: &str,
+    path: &Path,
+) -> Result<Option<String>, ConfigError> {
     match table.get(key) {
         None => Ok(None),
         Some(Value::String(value)) => Ok(Some(value.clone())),
@@ -166,7 +170,11 @@ fn optional_string(table: &toml::Table, key: &str, path: &Path) -> Result<Option
     }
 }
 
-fn optional_millis(table: &toml::Table, key: &str, path: &Path) -> Result<Option<u64>, ConfigError> {
+fn optional_millis(
+    table: &toml::Table,
+    key: &str,
+    path: &Path,
+) -> Result<Option<u64>, ConfigError> {
     match table.get(key) {
         None => Ok(None),
         Some(Value::Integer(value)) if *value >= 0 => Ok(Some(*value as u64)),
@@ -520,14 +528,19 @@ pub fn system_config_path() -> Result<PathBuf, ConfigError> {
         // to the passwd home's `.config`, which is what the XDG default is.
         None => {
             let home = sys::home_dir().map_err(ConfigError::Io)?;
-            Ok(home.join(".config").join("srun-portal").join(CONFIG_FILE_NAME))
+            Ok(home
+                .join(".config")
+                .join("srun-portal")
+                .join(CONFIG_FILE_NAME))
         }
     }
 }
 
 /// [`CONFIG_FILE_NAME`] next to the executable.
 pub fn portable_config_path() -> Result<PathBuf, ConfigError> {
-    Ok(sys::exe_dir().map_err(ConfigError::Io)?.join(CONFIG_FILE_NAME))
+    Ok(sys::exe_dir()
+        .map_err(ConfigError::Io)?
+        .join(CONFIG_FILE_NAME))
 }
 
 /// What [`resolve`] settled on.
@@ -562,7 +575,10 @@ pub fn resolve(
     if let Some(path) = explicit {
         let (file, created) = match ConfigFile::read(path)? {
             Some(file) => (file, false),
-            None => (ConfigFile::create(path, &Settings::documented_defaults())?, true),
+            None => (
+                ConfigFile::create(path, &Settings::documented_defaults())?,
+                true,
+            ),
         };
         let effective = Effective::layered(&[&file.settings]);
         return Ok(Resolution {
@@ -775,7 +791,10 @@ mod tests {
     fn unknown_keys_survive_rewrites() {
         let dir = TempDir::new("unknown");
         let path = dir.path().join(CONFIG_FILE_NAME);
-        write(&path, "portal_url = \"https://a/srun_portal_pc?ac_id=1\"\nextra = 1\n");
+        write(
+            &path,
+            "portal_url = \"https://a/srun_portal_pc?ac_id=1\"\nextra = 1\n",
+        );
 
         let mut file = ConfigFile::read(&path).unwrap().unwrap();
         assert_eq!(file.settings.portal_url.as_deref(), Some(&url("a")[..]));
@@ -798,9 +817,13 @@ mod tests {
         let path = dir.path().join(CONFIG_FILE_NAME);
         let mut file = ConfigFile::create(&path, &Settings::default()).unwrap();
 
-        assert!(file.update(&[("portal_url", Value::String(url("a")))]).unwrap());
+        assert!(file
+            .update(&[("portal_url", Value::String(url("a")))])
+            .unwrap());
         let after_first = std::fs::read_to_string(&path).unwrap();
-        assert!(!file.update(&[("portal_url", Value::String(url("a")))]).unwrap());
+        assert!(!file
+            .update(&[("portal_url", Value::String(url("a")))])
+            .unwrap());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), after_first);
     }
 
@@ -808,13 +831,19 @@ mod tests {
     fn portable_overrides_system_per_key() {
         let dir = TempDir::new("layers");
         let paths = scratch_paths(&dir);
-        write(&paths.system, "callback = \"b\"\nconnect_timeout_ms = 100\nreconnect_interval_secs = 600\n");
+        write(
+            &paths.system,
+            "callback = \"b\"\nconnect_timeout_ms = 100\nreconnect_interval_secs = 600\n",
+        );
         write(&paths.portable, "portal_url = \"https://p/srun_portal_pc?ac_id=1\"\ncallback = \"p\"\nreconnect_interval_secs = 60\n");
 
         let resolution = resolve(&paths, None, None, &mut never_asked).unwrap();
 
         assert_eq!(resolution.effective.callback, "p");
-        assert_eq!(resolution.effective.portal_url.as_deref(), Some(&url("p")[..]));
+        assert_eq!(
+            resolution.effective.portal_url.as_deref(),
+            Some(&url("p")[..])
+        );
         // The project file still overrides the system one, key by key.
         assert_eq!(resolution.effective.reconnect_interval_secs, Some(60));
         // The system file still supplies what the project file does not set.
@@ -852,12 +881,21 @@ mod tests {
     fn portable_wins_over_system() {
         let dir = TempDir::new("portable-wins");
         let paths = scratch_paths(&dir);
-        write(&paths.system, "portal_url = \"https://system/srun_portal_pc?ac_id=1\"\n");
-        write(&paths.portable, "portal_url = \"https://portable/srun_portal_pc?ac_id=1\"\n");
+        write(
+            &paths.system,
+            "portal_url = \"https://system/srun_portal_pc?ac_id=1\"\n",
+        );
+        write(
+            &paths.portable,
+            "portal_url = \"https://portable/srun_portal_pc?ac_id=1\"\n",
+        );
 
         let resolution = resolve(&paths, None, None, &mut never_asked).unwrap();
 
-        assert_eq!(resolution.base_path.as_deref(), Some(paths.portable.as_path()));
+        assert_eq!(
+            resolution.base_path.as_deref(),
+            Some(paths.portable.as_path())
+        );
         assert_eq!(
             resolution.effective.portal_url.as_deref(),
             Some(&url("portable")[..])
@@ -873,7 +911,10 @@ mod tests {
         let mut choose_portable = |_: &Paths| Storage::Portable;
         let resolution = resolve(&paths, None, None, &mut choose_portable).unwrap();
         assert!(resolution.created);
-        assert_eq!(resolution.base_path.as_deref(), Some(paths.portable.as_path()));
+        assert_eq!(
+            resolution.base_path.as_deref(),
+            Some(paths.portable.as_path())
+        );
         assert!(paths.portable.exists());
         assert!(!paths.system.exists());
 
@@ -882,7 +923,10 @@ mod tests {
         let mut choose_system = |_: &Paths| Storage::System;
         let resolution = resolve(&paths, None, None, &mut choose_system).unwrap();
         assert!(resolution.created);
-        assert_eq!(resolution.base_path.as_deref(), Some(paths.system.as_path()));
+        assert_eq!(
+            resolution.base_path.as_deref(),
+            Some(paths.system.as_path())
+        );
         assert!(paths.system.exists());
         assert!(!paths.portable.exists());
 
@@ -891,7 +935,10 @@ mod tests {
         let paths = scratch_paths(&dir);
         let resolution = resolve(&paths, None, Some(Storage::Portable), &mut never_asked).unwrap();
         assert!(resolution.created);
-        assert_eq!(resolution.base_path.as_deref(), Some(paths.portable.as_path()));
+        assert_eq!(
+            resolution.base_path.as_deref(),
+            Some(paths.portable.as_path())
+        );
     }
 
     #[test]
@@ -915,7 +962,10 @@ mod tests {
         let mut choose_system = |_: &Paths| Storage::System;
         let resolution = resolve(&paths, None, None, &mut choose_system).unwrap();
 
-        assert_eq!(resolution.imported_legacy.as_deref(), paths.legacy.as_deref());
+        assert_eq!(
+            resolution.imported_legacy.as_deref(),
+            paths.legacy.as_deref()
+        );
         assert_eq!(
             resolution.effective.portal_url.as_deref(),
             Some("https://net.szu.edu.cn/srun_portal_pc?ac_id=1")
@@ -935,7 +985,10 @@ mod tests {
     fn legacy_is_only_a_fallback() {
         let dir = TempDir::new("legacy-fallback");
         let paths = scratch_paths(&dir);
-        write(&paths.system, &format!("portal_url = \"{}\"\n", url("configured")));
+        write(
+            &paths.system,
+            &format!("portal_url = \"{}\"\n", url("configured")),
+        );
         write(
             paths.legacy.as_ref().unwrap(),
             r#"{"authURL":"https://legacy","acid":"9"}"#,
@@ -944,7 +997,10 @@ mod tests {
 
         let resolution = resolve(&paths, None, None, &mut never_asked).unwrap();
 
-        assert_eq!(resolution.effective.portal_url.as_deref(), Some(&url("configured")[..]));
+        assert_eq!(
+            resolution.effective.portal_url.as_deref(),
+            Some(&url("configured")[..])
+        );
         assert_eq!(resolution.imported_legacy, None);
         assert_eq!(std::fs::read_to_string(&paths.system).unwrap(), before);
 
@@ -973,7 +1029,10 @@ mod tests {
 
         let resolution = resolve(&paths, None, Some(Storage::Portable), &mut never_asked).unwrap();
 
-        assert_eq!(resolution.base_path.as_deref(), Some(paths.system.as_path()));
+        assert_eq!(
+            resolution.base_path.as_deref(),
+            Some(paths.system.as_path())
+        );
         assert!(paths.system.exists());
         assert!(!paths.portable.exists());
 
@@ -1029,7 +1088,10 @@ mod tests {
         let names: Vec<&str> = file.entries().into_iter().map(|(name, _)| name).collect();
         assert_eq!(
             names,
-            KEY_CATALOGUE.iter().map(|spec| spec.name).collect::<Vec<_>>()
+            KEY_CATALOGUE
+                .iter()
+                .map(|spec| spec.name)
+                .collect::<Vec<_>>()
         );
     }
 
@@ -1056,7 +1118,8 @@ mod tests {
         );
 
         file.update(&[("username", value)]).unwrap();
-        file.update(&[("reconnect_interval_secs", Value::Integer(600))]).unwrap();
+        file.update(&[("reconnect_interval_secs", Value::Integer(600))])
+            .unwrap();
         let reread = ConfigFile::read(&path).unwrap().unwrap();
         assert_eq!(reread.settings.username.as_deref(), Some("testuser"));
         assert_eq!(reread.settings.reconnect_interval_secs, Some(600));
@@ -1086,7 +1149,8 @@ mod tests {
         let dir = TempDir::new("unset-defaults");
         let path = dir.path().join(CONFIG_FILE_NAME);
         let mut file = ConfigFile::create(&path, &Settings::documented_defaults()).unwrap();
-        file.update(&[("reconnect_interval_secs", Value::Integer(600))]).unwrap();
+        file.update(&[("reconnect_interval_secs", Value::Integer(600))])
+            .unwrap();
 
         file.remove(&["reconnect_interval_secs"]).unwrap();
 
@@ -1160,7 +1224,10 @@ mod tests {
 
         let message = err.to_string();
         assert!(message.contains("connect_timeout_ms"), "{message}");
-        assert!(message.contains(&paths.system.display().to_string()), "{message}");
+        assert!(
+            message.contains(&paths.system.display().to_string()),
+            "{message}"
+        );
         assert!(matches!(err, ConfigError::Format { .. }));
 
         // A negative timeout is not a duration.
@@ -1176,7 +1243,10 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(message.contains("reconnect_interval_secs"), "{message}");
-        assert!(message.contains("must be a non-negative integer"), "{message}");
+        assert!(
+            message.contains("must be a non-negative integer"),
+            "{message}"
+        );
         write(&paths.system, "reconnect_boot_delay_secs = -5\n");
         assert!(matches!(
             load_existing(&paths, None),

@@ -118,7 +118,11 @@ pub fn parse_portal_url(raw: &str) -> Result<PortalUrl, ConfigError> {
         return Err(ConfigError::PortalUrlRequired);
     }
     let parts = split_absolute_url(&cleaned).ok_or(ConfigError::PortalUrlInvalid)?;
-    let UrlParts { origin, pathname, query } = parts;
+    let UrlParts {
+        origin,
+        pathname,
+        query,
+    } = parts;
     if !pathname.starts_with("/srun_portal") {
         return Err(ConfigError::PortalUrlInvalid);
     }
@@ -136,11 +140,18 @@ pub fn url_from_env(env: &CliEnv) -> Option<String> {
     if env.auth_url.is_empty() || env.acid.is_empty() {
         return None;
     }
-    Some(format!("{}/srun_portal_pc?ac_id={}", env.auth_url, env.acid))
+    Some(format!(
+        "{}/srun_portal_pc?ac_id={}",
+        env.auth_url, env.acid
+    ))
 }
 
 fn string_field(value: &Value, key: &str) -> String {
-    value.get(key).and_then(Value::as_str).unwrap_or("").to_string()
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
 }
 
 struct UrlParts {
@@ -179,7 +190,11 @@ fn split_absolute_url(raw: &str) -> Option<UrlParts> {
     };
     Some(UrlParts {
         origin,
-        pathname: if path.is_empty() { "/".to_string() } else { path.to_string() },
+        pathname: if path.is_empty() {
+            "/".to_string()
+        } else {
+            path.to_string()
+        },
         query: query.to_string(),
     })
 }
@@ -286,7 +301,8 @@ fn percent_decode(s: &str) -> String {
                 out.push(b' ');
                 i += 1;
             }
-            b'%' if i + 2 < bytes.len() => match (hex_value(bytes[i + 1]), hex_value(bytes[i + 2])) {
+            b'%' if i + 2 < bytes.len() => match (hex_value(bytes[i + 1]), hex_value(bytes[i + 2]))
+            {
                 (Some(hi), Some(lo)) => {
                     out.push(hi * 16 + lo);
                     i += 3;
@@ -358,7 +374,10 @@ mod tests {
         let Ok(home) = crate::sys::home_dir() else {
             return; // no passwd entry in this environment
         };
-        assert_eq!(legacy_env_file_path().unwrap(), home.join(".srun_portal.json"));
+        assert_eq!(
+            legacy_env_file_path().unwrap(),
+            home.join(".srun_portal.json")
+        );
         assert_eq!(
             legacy_env_file_path_in(Path::new("/tmp/x")),
             Path::new("/tmp/x/.srun_portal.json")
@@ -398,7 +417,10 @@ mod tests {
         assert!(matches!(read_legacy_from(&path), Err(ConfigError::Json(_))));
 
         // A directory cannot be read as a file.
-        assert!(matches!(read_legacy_from(dir.path()), Err(ConfigError::Io(_))));
+        assert!(matches!(
+            read_legacy_from(dir.path()),
+            Err(ConfigError::Io(_))
+        ));
     }
 
     #[test]
@@ -447,7 +469,8 @@ mod tests {
         assert_eq!(url.ac_id, "1");
 
         // Extra query parameters are ignored.
-        let url = parse_portal_url("https://net.szu.edu.cn/srun_portal_pc?ac_id=12&theme=app").unwrap();
+        let url =
+            parse_portal_url("https://net.szu.edu.cn/srun_portal_pc?ac_id=12&theme=app").unwrap();
         assert_eq!(url.ac_id, "12");
         assert_eq!(url.origin, "https://net.szu.edu.cn");
 
@@ -459,28 +482,46 @@ mod tests {
             "https://net.szu.edu.cn"
         );
         assert_eq!(
-            parse_portal_url("http://h:080/srun_portal_pc?ac_id=1").unwrap().origin,
+            parse_portal_url("http://h:080/srun_portal_pc?ac_id=1")
+                .unwrap()
+                .origin,
             "http://h"
         );
         // Userinfo is not part of the origin.
         assert_eq!(
-            parse_portal_url("http://u:p@h/srun_portal_pc?ac_id=1").unwrap().origin,
+            parse_portal_url("http://u:p@h/srun_portal_pc?ac_id=1")
+                .unwrap()
+                .origin,
             "http://h"
         );
         // The fragment is not the query.
         assert_eq!(
-            parse_portal_url("https://h/srun_portal_pc?ac_id=5#x").unwrap().ac_id,
+            parse_portal_url("https://h/srun_portal_pc?ac_id=5#x")
+                .unwrap()
+                .ac_id,
             "5"
         );
         // `ac_id` present without a value is still a present key.
-        assert_eq!(parse_portal_url("https://h/srun_portal_pc?ac_id").unwrap().ac_id, "");
+        assert_eq!(
+            parse_portal_url("https://h/srun_portal_pc?ac_id")
+                .unwrap()
+                .ac_id,
+            ""
+        );
 
         // The value is decoded like `URLSearchParams`.
         assert_eq!(
-            parse_portal_url("https://h/srun_portal_pc?ac_id=a%2Bb").unwrap().ac_id,
+            parse_portal_url("https://h/srun_portal_pc?ac_id=a%2Bb")
+                .unwrap()
+                .ac_id,
             "a+b"
         );
-        assert_eq!(parse_portal_url("https://h/srun_portal_pc?ac_id=1+2").unwrap().ac_id, "1 2");
+        assert_eq!(
+            parse_portal_url("https://h/srun_portal_pc?ac_id=1+2")
+                .unwrap()
+                .ac_id,
+            "1 2"
+        );
     }
 
     #[test]

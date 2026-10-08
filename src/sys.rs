@@ -170,8 +170,9 @@ mod platform_impl {
             let mut buf = vec![0i8; size];
             let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
             let mut result: *mut libc::passwd = std::ptr::null_mut();
-            let rc =
-                unsafe { libc::getpwuid_r(uid, &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result) };
+            let rc = unsafe {
+                libc::getpwuid_r(uid, &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result)
+            };
             if rc == libc::ERANGE && size < 1 << 20 {
                 size *= 2;
                 continue;
@@ -236,7 +237,11 @@ mod platform_impl {
         // async-signal-safe: a single write(2), then _exit
         let msg = crate::messages::EXIT_MESSAGE.as_bytes();
         unsafe {
-            libc::write(libc::STDERR_FILENO, msg.as_ptr() as *const libc::c_void, msg.len());
+            libc::write(
+                libc::STDERR_FILENO,
+                msg.as_ptr() as *const libc::c_void,
+                msg.len(),
+            );
             libc::_exit(0);
         }
     }
@@ -391,9 +396,7 @@ mod platform_impl {
             }
             AF_INET6 => {
                 let v6 = unsafe { &*(sa as *const SOCKADDR_IN6) };
-                Some(IpAddr::V6(Ipv6Addr::from(unsafe {
-                    v6.sin6_addr.u.Byte
-                })))
+                Some(IpAddr::V6(Ipv6Addr::from(unsafe { v6.sin6_addr.u.Byte })))
             }
             _ => None,
         }
@@ -478,9 +481,18 @@ mod tests {
     #[test]
     fn correct_user_ips_adopts_matching_interface() {
         let ifaces = vec![
-            NetIfAddr { name: "lo".into(), addr: "127.0.0.1".parse().unwrap() },
-            NetIfAddr { name: "eth0".into(), addr: "10.0.0.5".parse().unwrap() },
-            NetIfAddr { name: "eth0".into(), addr: "2001:db8::5".parse().unwrap() },
+            NetIfAddr {
+                name: "lo".into(),
+                addr: "127.0.0.1".parse().unwrap(),
+            },
+            NetIfAddr {
+                name: "eth0".into(),
+                addr: "10.0.0.5".parse().unwrap(),
+            },
+            NetIfAddr {
+                name: "eth0".into(),
+                addr: "2001:db8::5".parse().unwrap(),
+            },
         ];
         let mut ip = "10.0.0.5".to_string();
         let mut other = String::new();

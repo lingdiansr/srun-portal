@@ -55,7 +55,10 @@ pub fn reconnect_once(target: &Target, password: &str) -> Result<Outcome, String
     runtime.apply_interface_correction(&sys::network_interfaces(), &cfg.ip);
     runtime.spawn_other_stack_probe();
 
-    if runtime.check_online().map_err(|err| err.render(&runtime.translate))? {
+    if runtime
+        .check_online()
+        .map_err(|err| err.render(&runtime.translate))?
+    {
         return Ok(Outcome::AlreadyOnline);
     }
     runtime
@@ -66,14 +69,17 @@ pub fn reconnect_once(target: &Target, password: &str) -> Result<Outcome, String
 
 /// SPEC §3.2/§5: `GET {origin}/srun_portal_pc?ac_id=<url ac_id>&theme=app`, then
 /// read the embedded configuration out of the page.
-pub fn fetch_config(portal: &config::PortalUrl) -> Result<portal_config::PortalConfig, PortalError> {
+pub fn fetch_config(
+    portal: &config::PortalUrl,
+) -> Result<portal_config::PortalConfig, PortalError> {
     let url = format!(
         "{}{}?ac_id={}&theme=app",
         portal.origin,
         api::CONFIG_PATHNAME,
         transport::urlencode(&portal.ac_id)
     );
-    let html = transport::get_text(&url).map_err(|err| PortalError::ConfigFetch(err.to_string()))?;
+    let html =
+        transport::get_text(&url).map_err(|err| PortalError::ConfigFetch(err.to_string()))?;
     portal_config::parse(&html).map_err(|err| match err {
         ConfigError::CliVersionTooLow => PortalError::CliVersionTooLow,
         other => PortalError::ConfigFetch(other.to_string()),

@@ -184,7 +184,8 @@ pub fn install(plan: &Plan) -> Result<Vec<String>, Failure> {
 /// Whether this argv is a `systemctl … stop`/`disable` — the two commands whose
 /// failure means "there was nothing to clean up", not "the install broke".
 fn is_cleanup(argv: &[String]) -> bool {
-    argv.first().is_some_and(|program| program.ends_with("systemctl"))
+    argv.first()
+        .is_some_and(|program| program.ends_with("systemctl"))
         && argv.iter().any(|word| word == "stop" || word == "disable")
 }
 
@@ -268,7 +269,9 @@ pub fn status(plan: &Plan) -> Result<Vec<String>, String> {
     for argv in &plan.query {
         match Command::new(&argv[0]).args(&argv[1..]).output() {
             Ok(output) => {
-                let mut text = String::from_utf8_lossy(&output.stdout).trim_end().to_string();
+                let mut text = String::from_utf8_lossy(&output.stdout)
+                    .trim_end()
+                    .to_string();
                 let err = String::from_utf8_lossy(&output.stderr);
                 let err = err.trim_end();
                 if !err.is_empty() {
@@ -461,9 +464,15 @@ pub mod systemd {
         // placeholder trigger would be a lie — it would either fire or need a
         // far-future date systemd will not even parse. Only the service is
         // installed, and it is started by hand.
-        let mut files = vec![FileSpec { path: service.clone(), body: service_body }];
+        let mut files = vec![FileSpec {
+            path: service.clone(),
+            body: service_body,
+        }];
         if !manual_only {
-            files.push(FileSpec { path: timer.clone(), body: timer_body });
+            files.push(FileSpec {
+                path: timer.clone(),
+                body: timer_body,
+            });
         }
 
         // A previous install may have written and enabled the timer (its
@@ -491,7 +500,12 @@ pub mod systemd {
             disable,
             query: if manual_only {
                 // Nothing to ask about a timer that was not written.
-                vec![argv(&["systemctl", "--user", "cat", &format!("{LABEL}.service")])]
+                vec![argv(&[
+                    "systemctl",
+                    "--user",
+                    "cat",
+                    &format!("{LABEL}.service"),
+                ])]
             } else {
                 vec![
                     argv(&["systemctl", "--user", "is-enabled", &unit]),
@@ -520,7 +534,11 @@ pub mod launchd {
     pub fn plan(spec: &Spec) -> Plan {
         let dir = spec.home.join("Library").join("LaunchAgents");
         let plist = dir.join("com.srun-portal.reconnect.plist");
-        let log = spec.home.join("Library").join("Logs").join("srun-portal.log");
+        let log = spec
+            .home
+            .join("Library")
+            .join("Logs")
+            .join("srun-portal.log");
         let label = "com.srun-portal.reconnect";
         let (exe, config) = (
             super::xml_escape(&spec.exe.to_string_lossy()),
@@ -534,9 +552,9 @@ pub mod launchd {
             None => String::new(),
         };
         let interval = match spec.interval_secs {
-            Some(interval) => format!(
-                "\x20   <key>StartInterval</key>\n\x20   <integer>{interval}</integer>\n"
-            ),
+            Some(interval) => {
+                format!("\x20   <key>StartInterval</key>\n\x20   <integer>{interval}</integer>\n")
+            }
             None => String::new(),
         };
 
@@ -567,9 +585,21 @@ pub mod launchd {
         );
         let uid = uid();
         Plan {
-            files: vec![FileSpec { path: plist.clone(), body }],
-            enable: vec![argv(&["launchctl", "bootstrap", &format!("gui/{uid}"), &plist.to_string_lossy()])],
-            disable: vec![argv(&["launchctl", "bootout", &format!("gui/{uid}/{label}")])],
+            files: vec![FileSpec {
+                path: plist.clone(),
+                body,
+            }],
+            enable: vec![argv(&[
+                "launchctl",
+                "bootstrap",
+                &format!("gui/{uid}"),
+                &plist.to_string_lossy(),
+            ])],
+            disable: vec![argv(&[
+                "launchctl",
+                "bootout",
+                &format!("gui/{uid}/{label}"),
+            ])],
             query: vec![argv(&["launchctl", "list", label])],
             owned: vec![plist],
             cadence: spec.cadence(),
@@ -625,16 +655,40 @@ pub mod scheduler {
                 WINDOWS_TIMER_TASK,
                 &["/SC", "MINUTE", "/MO", &minutes],
             ));
-            disable.push(super::argv(&["schtasks", "/Delete", "/F", "/TN", WINDOWS_TIMER_TASK]));
+            disable.push(super::argv(&[
+                "schtasks",
+                "/Delete",
+                "/F",
+                "/TN",
+                WINDOWS_TIMER_TASK,
+            ]));
             query.push(super::argv(&[
-                "schtasks", "/Query", "/TN", WINDOWS_TIMER_TASK, "/V", "/FO", "LIST",
+                "schtasks",
+                "/Query",
+                "/TN",
+                WINDOWS_TIMER_TASK,
+                "/V",
+                "/FO",
+                "LIST",
             ]));
         }
         if spec.boot_delay_secs.is_some() {
             enable.push(create(WINDOWS_BOOT_TASK, &["/SC", "ONLOGON"]));
-            disable.push(super::argv(&["schtasks", "/Delete", "/F", "/TN", WINDOWS_BOOT_TASK]));
+            disable.push(super::argv(&[
+                "schtasks",
+                "/Delete",
+                "/F",
+                "/TN",
+                WINDOWS_BOOT_TASK,
+            ]));
             query.push(super::argv(&[
-                "schtasks", "/Query", "/TN", WINDOWS_BOOT_TASK, "/V", "/FO", "LIST",
+                "schtasks",
+                "/Query",
+                "/TN",
+                WINDOWS_BOOT_TASK,
+                "/V",
+                "/FO",
+                "LIST",
             ]));
         }
         Plan {
@@ -738,7 +792,13 @@ mod tests {
                 vec!["systemctl", "--user", "stop", "srun-portal.timer"],
                 vec!["systemctl", "--user", "disable", "srun-portal.timer"],
                 vec!["systemctl", "--user", "daemon-reload"],
-                vec!["systemctl", "--user", "enable", "--now", "srun-portal.timer"],
+                vec![
+                    "systemctl",
+                    "--user",
+                    "enable",
+                    "--now",
+                    "srun-portal.timer"
+                ],
             ]
         );
         assert_eq!(
@@ -753,7 +813,13 @@ mod tests {
             vec![
                 vec!["systemctl", "--user", "is-enabled", "srun-portal.timer"],
                 vec!["systemctl", "--user", "is-active", "srun-portal.timer"],
-                vec!["systemctl", "--user", "list-timers", "srun-portal.timer", "--no-pager"],
+                vec![
+                    "systemctl",
+                    "--user",
+                    "list-timers",
+                    "srun-portal.timer",
+                    "--no-pager"
+                ],
             ]
         );
     }
@@ -787,7 +853,10 @@ mod tests {
 
         let timer = &plan.files[1].body;
         assert!(!timer.contains("OnStartupSec"), "{timer}");
-        assert!(timer.contains("OnActiveSec=1s\nOnUnitActiveSec=300s\n"), "{timer}");
+        assert!(
+            timer.contains("OnActiveSec=1s\nOnUnitActiveSec=300s\n"),
+            "{timer}"
+        );
         assert_eq!(plan.cadence, "every 300s");
     }
 
@@ -803,24 +872,42 @@ mod tests {
         // placeholder trigger would be a lie, so there is simply no timer.
         let plan = systemd::plan(&manual);
         assert_eq!(plan.files.len(), 1, "{:?}", plan.files);
-        assert!(plan.files[0].path.ends_with("srun-portal.service"), "{:?}", plan.files);
+        assert!(
+            plan.files[0].path.ends_with("srun-portal.service"),
+            "{:?}",
+            plan.files
+        );
         assert!(plan.files[0].body.contains("reconnect\n"));
         // A previous install may have left an enabled timer behind, so it is
         // stopped and disabled; nothing is enabled in its place.
         assert!(
-            !plan.enable.iter().any(|a| a.contains(&"enable".to_string())),
+            !plan
+                .enable
+                .iter()
+                .any(|a| a.contains(&"enable".to_string())),
             "{:?}",
             plan.enable
         );
-        assert!(plan.enable.iter().any(|a| a.contains(&"stop".to_string())), "{:?}", plan.enable);
+        assert!(
+            plan.enable.iter().any(|a| a.contains(&"stop".to_string())),
+            "{:?}",
+            plan.enable
+        );
         // `status` has no timer to ask about.
         assert!(
-            !plan.query.iter().any(|a| a.contains(&"list-timers".to_string())),
+            !plan
+                .query
+                .iter()
+                .any(|a| a.contains(&"list-timers".to_string())),
             "{:?}",
             plan.query
         );
         // The timer path is still owned, so a leftover file is cleaned up.
-        assert!(plan.owned.iter().any(|p| p.ends_with("srun-portal.timer")), "{:?}", plan.owned);
+        assert!(
+            plan.owned.iter().any(|p| p.ends_with("srun-portal.timer")),
+            "{:?}",
+            plan.owned
+        );
 
         // launchd: no schedule keys at all, so bootstrap loads a job with no
         // triggers.
@@ -828,7 +915,10 @@ mod tests {
         let plist = &plan.files[0].body;
         assert!(!plist.contains("RunAtLoad"), "{plist}");
         assert!(!plist.contains("StartInterval"), "{plist}");
-        assert!(plist.contains("ProgramArguments"), "the job is still loaded");
+        assert!(
+            plist.contains("ProgramArguments"),
+            "the job is still loaded"
+        );
 
         // Windows: no tasks are created or deleted.
         let plan = scheduler::plan(&manual);
@@ -918,14 +1008,17 @@ mod tests {
         spec.config = PathBuf::from("/home/u/a&b<c>.toml");
         let plan = launchd::plan(&spec);
 
-        assert!(plan.files[0].body.contains("<string>/home/u/a&amp;b&lt;c&gt;.toml</string>"));
+        assert!(plan.files[0]
+            .body
+            .contains("<string>/home/u/a&amp;b&lt;c&gt;.toml</string>"));
         assert!(!plan.files[0].body.contains("a&b<c>"));
     }
 
     #[test]
     fn windows_tasks_are_exact() {
         let plan = scheduler::plan(&spec());
-        let action = "/opt/a/srun-portal --config /home/u/.config/srun-portal/srun-portal.toml reconnect";
+        let action =
+            "/opt/a/srun-portal --config /home/u/.config/srun-portal/srun-portal.toml reconnect";
 
         assert!(plan.files.is_empty());
         assert!(plan.owned.is_empty());
@@ -933,12 +1026,32 @@ mod tests {
             plan.enable,
             vec![
                 vec![
-                    "schtasks", "/Create", "/F", "/RL", "LIMITED", "/TN", "srun-portal-reconnect",
-                    "/SC", "MINUTE", "/MO", "5", "/TR", action,
+                    "schtasks",
+                    "/Create",
+                    "/F",
+                    "/RL",
+                    "LIMITED",
+                    "/TN",
+                    "srun-portal-reconnect",
+                    "/SC",
+                    "MINUTE",
+                    "/MO",
+                    "5",
+                    "/TR",
+                    action,
                 ],
                 vec![
-                    "schtasks", "/Create", "/F", "/RL", "LIMITED", "/TN", "srun-portal-reconnect-boot",
-                    "/SC", "ONLOGON", "/TR", action,
+                    "schtasks",
+                    "/Create",
+                    "/F",
+                    "/RL",
+                    "LIMITED",
+                    "/TN",
+                    "srun-portal-reconnect-boot",
+                    "/SC",
+                    "ONLOGON",
+                    "/TR",
+                    action,
                 ],
             ]
         );
@@ -946,7 +1059,13 @@ mod tests {
             plan.disable,
             vec![
                 vec!["schtasks", "/Delete", "/F", "/TN", "srun-portal-reconnect"],
-                vec!["schtasks", "/Delete", "/F", "/TN", "srun-portal-reconnect-boot"],
+                vec![
+                    "schtasks",
+                    "/Delete",
+                    "/F",
+                    "/TN",
+                    "srun-portal-reconnect-boot"
+                ],
             ]
         );
         assert_eq!(plan.cadence, "every 300s, 30s after startup");
@@ -954,7 +1073,10 @@ mod tests {
         // A sub-minute interval rounds up to `schtasks`' own minimum.
         let mut spec = spec();
         spec.interval_secs = Some(100);
-        assert_eq!(scheduler::plan(&spec).cadence, "every 100s, 30s after startup");
+        assert_eq!(
+            scheduler::plan(&spec).cadence,
+            "every 100s, 30s after startup"
+        );
         spec.interval_secs = Some(1);
         let plan = scheduler::plan(&spec);
         let argv = &plan.enable[0];
@@ -1011,8 +1133,7 @@ mod tests {
 
     impl TempDir {
         fn new(tag: &str) -> Self {
-            static COUNTER: std::sync::atomic::AtomicUsize =
-                std::sync::atomic::AtomicUsize::new(0);
+            static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
             let unique = format!(
                 "srun-portal-service-{}-{}-{}",
                 tag,
@@ -1036,7 +1157,10 @@ mod tests {
         let dir = TempDir::new("install");
         let nested = dir.path.join("a").join("b").join("unit.conf");
         let plan = Plan {
-            files: vec![FileSpec { path: nested.clone(), body: "hello\n".to_string() }],
+            files: vec![FileSpec {
+                path: nested.clone(),
+                body: "hello\n".to_string(),
+            }],
             enable: vec![vec!["/bin/true".to_string()]],
             query: Vec::new(),
             owned: vec![nested.clone()],
@@ -1075,8 +1199,14 @@ mod tests {
         let log = uninstall(&plan).unwrap();
         assert_eq!(log, vec![format!("Removed {}", nested.display())]);
         assert!(!nested.exists());
-        assert!(!dir.path.join("a").join("b").exists(), "the emptied parent is pruned");
-        assert!(dir.path.join("a").exists(), "and nothing above it is touched");
+        assert!(
+            !dir.path.join("a").join("b").exists(),
+            "the emptied parent is pruned"
+        );
+        assert!(
+            dir.path.join("a").exists(),
+            "and nothing above it is touched"
+        );
 
         // Doing it again is not an error: nothing is left.
         let log = uninstall(&plan).unwrap();
@@ -1088,14 +1218,21 @@ mod tests {
         let dir = TempDir::new("install-fail");
         let file = dir.path.join("unit.conf");
         let plan = Plan {
-            files: vec![FileSpec { path: file.clone(), body: "x".to_string() }],
+            files: vec![FileSpec {
+                path: file.clone(),
+                body: "x".to_string(),
+            }],
             enable: vec![vec!["/bin/false".to_string()]],
             ..Plan::default()
         };
         let failure = install(&plan).unwrap_err();
         // The file was written before the command failed, and that is reported.
         assert_eq!(failure.log, vec![format!("Wrote {}", file.display())]);
-        assert!(failure.error.starts_with("/bin/false failed:"), "{}", failure.error);
+        assert!(
+            failure.error.starts_with("/bin/false failed:"),
+            "{}",
+            failure.error
+        );
         assert!(file.exists(), "the written file is not rolled back");
     }
 
@@ -1123,7 +1260,10 @@ mod tests {
         // …while the cleanup pair is summarised and the install carries on.
         let file = dir.path.join("unit.conf");
         let plan = Plan {
-            files: vec![FileSpec { path: file.clone(), body: "x".to_string() }],
+            files: vec![FileSpec {
+                path: file.clone(),
+                body: "x".to_string(),
+            }],
             enable: vec![
                 vec![
                     fake.clone(),
@@ -1152,7 +1292,10 @@ mod tests {
         let file = dir.path.join("unit.conf");
         std::fs::write(&file, "x").unwrap();
         let plan = Plan {
-            files: vec![FileSpec { path: file.clone(), body: "x".to_string() }],
+            files: vec![FileSpec {
+                path: file.clone(),
+                body: "x".to_string(),
+            }],
             disable: vec![
                 vec!["/bin/false".to_string()],
                 vec!["/bin/echo".to_string(), "bye".to_string()],

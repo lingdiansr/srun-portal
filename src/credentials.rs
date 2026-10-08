@@ -74,7 +74,11 @@ pub fn path_for(config: &Path) -> PathBuf {
 /// A facility failure is not fatal: the file takes over and the error is
 /// returned alongside the store that was actually used. Returns `(store, note)`
 /// where `note` explains the fallback, for the caller to print.
-pub fn store(account: &str, password: &str, path: &Path) -> Result<(Store, Option<String>), String> {
+pub fn store(
+    account: &str,
+    password: &str,
+    path: &Path,
+) -> Result<(Store, Option<String>), String> {
     match keyring::availability() {
         keyring::Availability::Ready => match keyring::store(account, password) {
             Ok(()) => Ok((Store::Keyring, None)),
@@ -83,7 +87,9 @@ pub fn store(account: &str, password: &str, path: &Path) -> Result<(Store, Optio
                     .map_err(|file_err| format!("keyring: {err}; file: {file_err}"))?;
                 Ok((
                     Store::File,
-                    Some(format!("Keyring unavailable ({err}); stored in the file instead")),
+                    Some(format!(
+                        "Keyring unavailable ({err}); stored in the file instead"
+                    )),
                 ))
             }
         },
@@ -92,7 +98,9 @@ pub fn store(account: &str, password: &str, path: &Path) -> Result<(Store, Optio
                 .map_err(|file_err| format!("keyring unavailable ({reason}); file: {file_err}"))?;
             Ok((
                 Store::File,
-                Some(format!("Keyring unavailable ({reason}); stored in the file instead")),
+                Some(format!(
+                    "Keyring unavailable ({reason}); stored in the file instead"
+                )),
             ))
         }
     }
@@ -167,7 +175,10 @@ pub fn write(path: &Path, password: &str) -> Result<(), ConfigError> {
                 .map_err(|err| ConfigError::Io(format!("{}: {err}", parent.display())))?;
         }
     }
-    let body = format!("{HEADER}password = {}\n", Value::String(password.to_string()));
+    let body = format!(
+        "{HEADER}password = {}\n",
+        Value::String(password.to_string())
+    );
     create_private(path, body.as_bytes())?;
     // `mode` only applies at creation, so a file that already existed wider
     // than 0600 is tightened here too.
@@ -292,7 +303,10 @@ mod tests {
     #[test]
     fn a_missing_file_is_no_password() {
         let dir = TempDir::new("missing");
-        assert_eq!(read_file(&dir.path().join(CREDENTIALS_FILE_NAME)).unwrap(), None);
+        assert_eq!(
+            read_file(&dir.path().join(CREDENTIALS_FILE_NAME)).unwrap(),
+            None
+        );
     }
 
     /// The priority between the two stores, and that `revoke` clears both.
@@ -406,8 +420,14 @@ mod tests {
             resolve_password(Some(""), Some("stored".to_string())),
             Some("stored".to_string())
         );
-        assert_eq!(resolve_password(None, Some("stored".to_string())), Some("stored".to_string()));
-        assert_eq!(resolve_password(Some("from-env"), None), Some("from-env".to_string()));
+        assert_eq!(
+            resolve_password(None, Some("stored".to_string())),
+            Some("stored".to_string())
+        );
+        assert_eq!(
+            resolve_password(Some("from-env"), None),
+            Some("from-env".to_string())
+        );
         assert_eq!(resolve_password(None, None), None);
     }
 }

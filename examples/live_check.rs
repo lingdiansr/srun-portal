@@ -6,7 +6,9 @@
 //! cargo run --example live_check -- [portal-url] [username]
 //! ```
 
-use srun_portal::{api, config, portal_config, runtime::Runtime, runtime::RuntimeOptions, settings, transport};
+use srun_portal::{
+    api, config, portal_config, runtime::Runtime, runtime::RuntimeOptions, settings, transport,
+};
 
 const DEFAULT_SLUG: &str = "https://net.szu.edu.cn/srun_portal_pc?ac_id=1";
 
@@ -45,7 +47,11 @@ fn main() {
     println!("isIPv6       : {}", cfg.is_ipv6);
     println!("DoubleStackPC: {}", cfg.portal.double_stack_pc());
     println!("MacAuth      : {}", cfg.portal.mac_auth());
-    println!("AuthIP/AuthIP6: {} / {}", cfg.portal.auth_ip(), cfg.portal.auth_ip6());
+    println!(
+        "AuthIP/AuthIP6: {} / {}",
+        cfg.portal.auth_ip(),
+        cfg.portal.auth_ip6()
+    );
     println!("AccountFilter: {:?}", cfg.portal.account_filter());
 
     let host = portal
@@ -67,7 +73,7 @@ fn main() {
         }
     }
 
-    match runtime.get_user_info(Some(&cfg.ip)).map(|info| info.clone()) {
+    match runtime.get_user_info(Some(&cfg.ip)).cloned() {
         Ok(info) => {
             let sysver = match info.raw.get("sysver") {
                 Some(value) => value.to_string(),

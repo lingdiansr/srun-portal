@@ -62,8 +62,7 @@ impl Stub {
     fn last_query_for(&self, path: &str) -> Option<String> {
         self.queries()
             .into_iter()
-            .filter(|line| line.starts_with(&format!("{path} ")))
-            .next_back()
+            .rfind(|line| line.starts_with(&format!("{path} ")))
             .and_then(|line| line.split_once(' ').map(|(_, query)| query.to_string()))
     }
 
@@ -109,7 +108,10 @@ fn page() -> String {
 /// The JSONP wrapper the stub answers with: the callback name the request
 /// carried, echoed the way the real portal echoes it.
 fn jsonp(params: &std::collections::HashMap<String, String>, value: serde_json::Value) -> String {
-    let callback = params.get("callback").map(String::as_str).unwrap_or("jsonp");
+    let callback = params
+        .get("callback")
+        .map(String::as_str)
+        .unwrap_or("jsonp");
     format!("{callback}({value})")
 }
 
@@ -138,9 +140,7 @@ fn serve(
     let _method = parts.next().unwrap_or("");
     let target = parts.next().unwrap_or("/");
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
-    log.lock()
-        .expect("log")
-        .push(format!("{path} {query}"));
+    log.lock().expect("log").push(format!("{path} {query}"));
     let params = parse_query(query);
 
     let body = match path {
@@ -172,7 +172,8 @@ fn serve(
         }
         "/v2/srun_portal_message" => json!({"code": 0, "data": []}).to_string(),
         "/v1/srun_portal_agree_new" => {
-            json!({"code": 0, "data": {"data": {"id": 1, "title": "t", "content": "c"}}}).to_string()
+            json!({"code": 0, "data": {"data": {"id": 1, "title": "t", "content": "c"}}})
+                .to_string()
         }
         _ => "not found".to_string(),
     };
@@ -202,18 +203,16 @@ fn percent_decode(value: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
-            b'%' if i + 2 < bytes.len() => {
-                match u8::from_str_radix(&value[i + 1..i + 3], 16) {
-                    Ok(byte) => {
-                        out.push(byte);
-                        i += 3;
-                    }
-                    Err(_) => {
-                        out.push(bytes[i]);
-                        i += 1;
-                    }
+            b'%' if i + 2 < bytes.len() => match u8::from_str_radix(&value[i + 1..i + 3], 16) {
+                Ok(byte) => {
+                    out.push(byte);
+                    i += 3;
                 }
-            }
+                Err(_) => {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            },
             b'+' => {
                 out.push(b' ');
                 i += 1;
@@ -364,7 +363,10 @@ fn rejected_credentials_are_reported_and_not_retried_by_the_library() {
         .core_auth("testuser", "testpass", false, false)
         .expect_err("the portal never reports the session online");
     assert_eq!(err.to_string(), "Login failed");
-    assert!(started.elapsed().as_millis() >= 2_000, "expected the 1 s retry gaps");
+    assert!(
+        started.elapsed().as_millis() >= 2_000,
+        "expected the 1 s retry gaps"
+    );
 }
 
 #[test]
@@ -430,17 +432,19 @@ fn double_stack_sign_out_unbinds_both_stacks() {
     ))
     .expect("config page");
     let mut cfg = portal_config::parse(&html).expect("config parses");
-    cfg.portal = srun_portal::portal_config::PortalFlags::from_map(match json!({
-        "AuthIP": "127.0.0.1",
-        "AuthIP6": "127.0.0.1",
-        "DoubleStackPC": true,
-        "DoubleStackMobile": false,
-        "MacAuth": false,
-        "AccountFilter": ""
-    }) {
-        serde_json::Value::Object(map) => map,
-        other => panic!("flags must be an object: {other}"),
-    });
+    cfg.portal = srun_portal::portal_config::PortalFlags::from_map(
+        match json!({
+            "AuthIP": "127.0.0.1",
+            "AuthIP6": "127.0.0.1",
+            "DoubleStackPC": true,
+            "DoubleStackMobile": false,
+            "MacAuth": false,
+            "AccountFilter": ""
+        }) {
+            serde_json::Value::Object(map) => map,
+            other => panic!("flags must be an object: {other}"),
+        },
+    );
 
     let host = stub.origin.split_once("://").expect("origin").1.to_string();
     let mut runtime = Runtime::new(RuntimeOptions::from_config(&cfg, &portal.origin, &host));
@@ -467,7 +471,10 @@ fn double_stack_sign_out_unbinds_both_stacks() {
         assert_eq!(params["unbind"], "1");
         assert_eq!(params["username"], "testuser");
         let time: i64 = params["time"].parse().expect("integer seconds");
-        assert_eq!(params["sign"], api::dm_sign("testuser", &params["ip"], time));
+        assert_eq!(
+            params["sign"],
+            api::dm_sign("testuser", &params["ip"], time)
+        );
     }
     assert!(!runtime.is_online);
 }

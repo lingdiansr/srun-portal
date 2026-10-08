@@ -75,7 +75,7 @@ impl PortalFlags {
     /// JS truthiness: `false`, `null`, `0`, `""` and a missing property are
     /// falsy; every array and object is truthy.
     pub fn bool(&self, name: &str) -> bool {
-        self.get(name).map_or(false, truthy)
+        self.get(name).is_some_and(truthy)
     }
 
     /// `Number(portal.X)`: a JSON number or a numeric string; `None` when the
@@ -184,7 +184,11 @@ pub enum ConfigError {
     /// The page has no element with that id, where the JSON rows require one.
     MissingId(String),
     /// `JSON.parse` of the element text threw.
-    NotJson { id: String, raw: String, detail: String },
+    NotJson {
+        id: String,
+        raw: String,
+        detail: String,
+    },
     /// The element held valid JSON of the wrong type (a string was required).
     NotString { id: String, raw: String },
 }
@@ -234,7 +238,7 @@ pub fn parse(html: &str) -> Result<PortalConfig, ConfigError> {
     let custom = CustomConfig {
         project: element_html(html, "project"),
         color: element_html(html, "color"),
-        use_logo: element_html(html, "useLogo").map_or(false, |text| text == "true"),
+        use_logo: element_html(html, "useLogo").is_some_and(|text| text == "true"),
         show_info_list: element_html(html, "showInfoList")
             .map(|text| text.split(',').map(str::to_string).collect())
             .unwrap_or_default(),
@@ -330,7 +334,7 @@ fn truthy(value: &Value) -> bool {
     match value {
         Value::Null => false,
         Value::Bool(b) => *b,
-        Value::Number(n) => n.as_f64().map_or(true, |f| f != 0.0),
+        Value::Number(n) => n.as_f64() != Some(0.0),
         Value::String(s) => !s.is_empty(),
         Value::Array(_) | Value::Object(_) => true,
     }
@@ -425,7 +429,7 @@ mod tests {
         assert_eq!(flags.get("AuthIP"), Some(&json!("1.1.1.1")));
         assert_eq!(flags.get("Missing"), None);
         assert_eq!(flags.str("Missing"), "");
-        assert_eq!(flags.bool("Missing"), false);
+        assert!(!flags.bool("Missing"));
         assert_eq!(flags.num("Missing"), None);
         assert_eq!(flags.num("AuthIP"), None);
         assert_eq!(flags.str_or("Missing", "fallback"), "fallback");
@@ -434,7 +438,9 @@ mod tests {
 
     #[test]
     fn optional_flags_are_absent_without_the_property() {
-        let flags = parse(&page(r##"<span id="portal">{}</span>"##)).unwrap().portal;
+        let flags = parse(&page(r##"<span id="portal">{}</span>"##))
+            .unwrap()
+            .portal;
         assert_eq!(flags.raw().len(), 0);
         assert_eq!(flags.auth_ip(), "");
         assert_eq!(flags.auth_ip6(), "");
@@ -495,7 +501,8 @@ mod tests {
 
     #[test]
     fn empty_cli_version_is_too_low() {
-        let err = parse(r##"<span id="cliVersion"></span><span id="acid">"12"</span>"##).unwrap_err();
+        let err =
+            parse(r##"<span id="cliVersion"></span><span id="acid">"12"</span>"##).unwrap_err();
         assert!(matches!(err, ConfigError::CliVersionTooLow));
     }
 
@@ -571,7 +578,10 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        let ok = parse(&format!("{prefix}<span id=\"isIPv6\">true</span><span id=\"portal\">{{}}</span>")).unwrap();
+        let ok = parse(&format!(
+            "{prefix}<span id=\"isIPv6\">true</span><span id=\"portal\">{{}}</span>"
+        ))
+        .unwrap();
         assert!(ok.is_ipv6);
     }
 

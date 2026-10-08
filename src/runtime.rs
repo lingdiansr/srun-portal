@@ -46,14 +46,22 @@ pub enum PortalError {
     LogoutFailed,
     Timeout,
     Transport(String),
-    MissingField { endpoint: &'static str, field: &'static str },
+    MissingField {
+        endpoint: &'static str,
+        field: &'static str,
+    },
 }
 
 impl PortalError {
     /// Render through `Translate` so API errors follow the SPEC §10 precedence.
     pub fn render(&self, translate: &Translate) -> String {
         match self {
-            PortalError::Api { error, ecode, error_msg, ploy_msg } => {
+            PortalError::Api {
+                error,
+                ecode,
+                error_msg,
+                ploy_msg,
+            } => {
                 let mut res = serde_json::Map::new();
                 res.insert("error".into(), Value::String(error.clone()));
                 if let Some(v) = ecode {
@@ -77,9 +85,12 @@ impl std::fmt::Display for PortalError {
         match self {
             PortalError::ConfigFetch(err) => write!(f, "Get portal config error: {err}"),
             PortalError::CliVersionTooLow => f.write_str(crate::messages::CLI_VERSION_TOO_LOW),
-            PortalError::Api { error, ecode, error_msg, .. } => {
-                f.write_str(ecode.as_deref().or(error_msg.as_deref()).unwrap_or(error))
-            }
+            PortalError::Api {
+                error,
+                ecode,
+                error_msg,
+                ..
+            } => f.write_str(ecode.as_deref().or(error_msg.as_deref()).unwrap_or(error)),
             PortalError::DomainNeedsAt => f.write_str(crate::messages::DOMAIN_NEEDS_AT),
             PortalError::LoginFailed => f.write_str(crate::messages::LOGIN_FAILED),
             PortalError::LogoutFailed => f.write_str(crate::messages::LOGOUT_FAILED),
@@ -104,9 +115,17 @@ impl From<ApiError> for PortalError {
     fn from(err: ApiError) -> Self {
         match err {
             ApiError::Transport(err) => PortalError::Transport(err.to_string()),
-            ApiError::Api { error, ecode, error_msg, ploy_msg } => {
-                PortalError::Api { error, ecode, error_msg, ploy_msg }
-            }
+            ApiError::Api {
+                error,
+                ecode,
+                error_msg,
+                ploy_msg,
+            } => PortalError::Api {
+                error,
+                ecode,
+                error_msg,
+                ploy_msg,
+            },
             ApiError::MissingField { endpoint, field } => {
                 PortalError::MissingField { endpoint, field }
             }
@@ -387,12 +406,18 @@ impl Runtime {
     /// `getUserInfo`: whole-object replacement of `userinfo`, `user_mac`
     /// write-back and the `apiVersion` derivation (SPEC §5, §8).
     pub fn get_user_info(&mut self, ip: Option<&str>) -> Result<&UserInfo, PortalError> {
-        let ip = ip.map(|s| s.to_string()).unwrap_or_else(|| self.user_ip.clone());
+        let ip = ip
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| self.user_ip.clone());
         let res = api::rad_user_info(&self.ep, Some(&ip), false, &self.callback)?;
         self.userinfo = UserInfo::from_response(&res);
         self.user_mac = self.userinfo.user_mac.clone();
         self.is_online = res.get("error").and_then(Value::as_str) == Some("ok");
-        self.api_version = if self.is_online { api_version_of(&res) } else { None };
+        self.api_version = if self.is_online {
+            api_version_of(&res)
+        } else {
+            None
+        };
         Ok(&self.userinfo)
     }
 
@@ -507,7 +532,10 @@ impl Runtime {
         // that assumption does not hold.
         if salt_expired(challenge.expire_secs, started.elapsed()) {
             let fresh = self.get_challenge(username_with_domain, ip, other_stack)?;
-            let params = LoginParams { token: &fresh.token, ..params };
+            let params = LoginParams {
+                token: &fresh.token,
+                ..params
+            };
             request = api::build_login(&params);
         }
         api::send_login(&self.ep, &request, other_stack, &self.callback).map_err(Into::into)
@@ -588,14 +616,26 @@ impl Runtime {
             // promises to `promiseAny`); every failure or the timeout is
             // reported as `Timeout`, which is what `promiseAny` rejects with.
             let tasks = vec![
-                dm_task(username.clone(), self.user_ip.clone(), false, callback.clone()),
+                dm_task(
+                    username.clone(),
+                    self.user_ip.clone(),
+                    false,
+                    callback.clone(),
+                ),
                 dm_task(username, self.user_ip_other_stack(), true, callback),
             ];
             util::promise_any(tasks, api::PROMISE_ANY_TIMEOUT_MS)
                 .map_err(|_| PortalError::Timeout)?;
             self.check_sign_out_success(None)?;
         } else {
-            let res = api::send_dm(&self.ep, &username, &self.user_ip, time, false, &self.callback)?;
+            let res = api::send_dm(
+                &self.ep,
+                &username,
+                &self.user_ip,
+                time,
+                false,
+                &self.callback,
+            )?;
             if res.get("error").and_then(Value::as_str) != Some("ok") {
                 return Err(api_error(&res));
             }

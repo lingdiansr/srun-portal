@@ -275,7 +275,10 @@ mod tests {
     fn data_id_is_not_the_id_attribute() {
         let html = "<span data-id=\"acid\">nope</span><span id=\"acid\">\"12\"</span>";
         assert_eq!(element_html(html, "acid").as_deref(), Some("\"12\""));
-        assert_eq!(element_html("<span data-id=\"acid\">nope</span>", "acid"), None);
+        assert_eq!(
+            element_html("<span data-id=\"acid\">nope</span>", "acid"),
+            None
+        );
     }
 
     #[test]
@@ -286,10 +289,19 @@ mod tests {
 
     #[test]
     fn void_and_self_closing_elements_are_empty() {
-        assert_eq!(element_html("<input id=\"a\" value=\"1\">tail", "a").as_deref(), Some(""));
+        assert_eq!(
+            element_html("<input id=\"a\" value=\"1\">tail", "a").as_deref(),
+            Some("")
+        );
         assert_eq!(element_html("<br id=\"b\"/>tail", "b").as_deref(), Some(""));
-        assert_eq!(element_html("<br id=\"c\" />tail", "c").as_deref(), Some(""));
-        assert_eq!(element_html("<meta id=\"d\" charset=\"utf-8\">", "d").as_deref(), Some(""));
+        assert_eq!(
+            element_html("<br id=\"c\" />tail", "c").as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            element_html("<meta id=\"d\" charset=\"utf-8\">", "d").as_deref(),
+            Some("")
+        );
     }
 
     #[test]
@@ -300,7 +312,10 @@ mod tests {
 
     #[test]
     fn unclosed_element_runs_to_end_of_document() {
-        assert_eq!(element_html("<div id=\"x\">tail", "x").as_deref(), Some("tail"));
+        assert_eq!(
+            element_html("<div id=\"x\">tail", "x").as_deref(),
+            Some("tail")
+        );
     }
 
     #[test]

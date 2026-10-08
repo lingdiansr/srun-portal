@@ -110,9 +110,9 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
             continue;
         }
         if args.command.is_none() && arg == "config" {
-            let action = rest.next().ok_or_else(|| {
-                "config needs an action: show, list, set or unset".to_string()
-            })?;
+            let action = rest
+                .next()
+                .ok_or_else(|| "config needs an action: show, list, set or unset".to_string())?;
             let action = match action.as_str() {
                 "show" => ConfigAction::Show,
                 "list" => ConfigAction::List,
@@ -240,7 +240,12 @@ pub fn run(argv: Vec<String>) -> i32 {
     // The configured URL is what the next run reads first, so it is recorded in
     // the file that was read first: the project file, or the system one.
     if let Some(base) = resolution.base.as_mut() {
-        let slug = format!("{}{}?ac_id={}", portal.origin, api::CONFIG_PATHNAME, portal.ac_id);
+        let slug = format!(
+            "{}{}?ac_id={}",
+            portal.origin,
+            api::CONFIG_PATHNAME,
+            portal.ac_id
+        );
         if let Err(err) = base.update(&[("portal_url", toml::Value::String(slug))]) {
             eprintln!("{err}");
         }
@@ -263,12 +268,10 @@ pub fn run(argv: Vec<String>) -> i32 {
     if online {
         show_account_info(&runtime);
         match confirm("Do you want to sign out? (y/N): ") {
-            Ok(true) => {
-                match runtime.sign_out() {
-                    Ok(()) => println!("Sign out success!"),
-                    Err(err) => println!("SignOut failed: {}", err.render(&runtime.translate)),
-                }
-            }
+            Ok(true) => match runtime.sign_out() {
+                Ok(()) => println!("Sign out success!"),
+                Err(err) => println!("SignOut failed: {}", err.render(&runtime.translate)),
+            },
             Ok(false) => {}
             Err(err) => {
                 eprintln!("{err}");
@@ -417,8 +420,14 @@ fn run_config(action: &ConfigAction, args: &Args) -> i32 {
 /// the "not set" cases spelled out rather than shown as an empty line.
 fn effective_value(effective: &settings::Effective, key: &str) -> String {
     match key {
-        "portal_url" => effective.portal_url.clone().unwrap_or_else(|| "(not set)".into()),
-        "username" => effective.username.clone().unwrap_or_else(|| "(not set)".into()),
+        "portal_url" => effective
+            .portal_url
+            .clone()
+            .unwrap_or_else(|| "(not set)".into()),
+        "username" => effective
+            .username
+            .clone()
+            .unwrap_or_else(|| "(not set)".into()),
         "domain" => match effective.domain.as_deref() {
             Some("") => "(empty: no suffix)".to_string(),
             Some(domain) => domain.to_string(),
@@ -630,11 +639,10 @@ fn run_service(action: ServiceAction, args: &Args) -> i32 {
                 Ok(account) => account,
                 Err(status) => return status,
             };
-            let password =
-                match install_password(&account, resolution.base_path.as_deref()) {
-                    Ok(password) => password,
-                    Err(status) => return status,
-                };
+            let password = match install_password(&account, resolution.base_path.as_deref()) {
+                Ok(password) => password,
+                Err(status) => return status,
+            };
             // Prove the credentials before writing anything: a task with a
             // wrong password would fail silently every interval.
             let target = reconnect::Target {
@@ -662,7 +670,11 @@ fn run_service(action: ServiceAction, args: &Args) -> i32 {
                     if let Some(note) = note {
                         println!("{note}");
                     }
-                    println!("Password: stored in the {} ({})", store.name(), target.username);
+                    println!(
+                        "Password: stored in the {} ({})",
+                        store.name(),
+                        target.username
+                    );
                     if store == credentials::Store::File {
                         println!("Chmod 600 {}", credentials_path.display());
                     }
@@ -719,7 +731,11 @@ fn run_service(action: ServiceAction, args: &Args) -> i32 {
                 );
             }
             if let Ok(account) = configured_username(&resolution.effective) {
-                if credentials::read(&account, &credentials_path).ok().flatten().is_some() {
+                if credentials::read(&account, &credentials_path)
+                    .ok()
+                    .flatten()
+                    .is_some()
+                {
                     println!(
                         "Kept the stored password for {account} (run `srun-portal service forget`)"
                     );
@@ -792,7 +808,10 @@ fn run_service(action: ServiceAction, args: &Args) -> i32 {
 /// One line describing where the password currently comes from, for `status`.
 fn credentials_status(resolution: &settings::Resolution, config: &std::path::Path) -> String {
     if std::env::var(credentials::ENV_PASSWORD).is_ok_and(|value| !value.is_empty()) {
-        return format!("{} is set (overrides any stored password)", credentials::ENV_PASSWORD);
+        return format!(
+            "{} is set (overrides any stored password)",
+            credentials::ENV_PASSWORD
+        );
     }
     let account = match configured_username(&resolution.effective) {
         Ok(account) => account,
@@ -1096,7 +1115,10 @@ mod tests {
         ])
         .unwrap();
         assert!(args.portable);
-        assert_eq!(args.portal_url.as_deref(), Some("https://h/srun_portal_pc?ac_id=1"));
+        assert_eq!(
+            args.portal_url.as_deref(),
+            Some("https://h/srun_portal_pc?ac_id=1")
+        );
 
         // Both spellings of `--config`, and `--help`.
         let args = parse_args(&["--config".to_string(), "/tmp/a.toml".to_string()]).unwrap();
@@ -1107,12 +1129,24 @@ mod tests {
 
         // Usage errors: a missing or empty `--config` value, an unknown option,
         // and a second positional argument.
-        assert_eq!(parse_args(&["--config".to_string()]).unwrap_err(), "--config needs a path");
-        assert_eq!(parse_args(&["--config=".to_string()]).unwrap_err(), "--config needs a path");
-        assert_eq!(parse_args(&["--nope".to_string()]).unwrap_err(), "Unknown option: --nope");
         assert_eq!(
-            parse_args(&["https://a.example/srun_portal_pc?ac_id=1".to_string(), "extra".to_string()])
-                .unwrap_err(),
+            parse_args(&["--config".to_string()]).unwrap_err(),
+            "--config needs a path"
+        );
+        assert_eq!(
+            parse_args(&["--config=".to_string()]).unwrap_err(),
+            "--config needs a path"
+        );
+        assert_eq!(
+            parse_args(&["--nope".to_string()]).unwrap_err(),
+            "Unknown option: --nope"
+        );
+        assert_eq!(
+            parse_args(&[
+                "https://a.example/srun_portal_pc?ac_id=1".to_string(),
+                "extra".to_string()
+            ])
+            .unwrap_err(),
             "Unexpected argument: extra"
         );
     }
@@ -1173,8 +1207,12 @@ mod tests {
             "Unknown config action: frobnicate"
         );
         assert_eq!(
-            parse_args(&["config".to_string(), "set".to_string(), "username".to_string()])
-                .unwrap_err(),
+            parse_args(&[
+                "config".to_string(),
+                "set".to_string(),
+                "username".to_string()
+            ])
+            .unwrap_err(),
             "config set needs KEY VALUE pairs, e.g. `config set username testuser`"
         );
         assert_eq!(
@@ -1182,17 +1220,15 @@ mod tests {
             "config unset needs at least one KEY"
         );
         // Options may still precede the command.
-        assert!(
-            parse_args(&[
-                "--config".to_string(),
-                "/tmp/a.toml".to_string(),
-                "config".to_string(),
-                "show".to_string(),
-            ])
-            .unwrap()
-            .config
-            .is_some()
-        );
+        assert!(parse_args(&[
+            "--config".to_string(),
+            "/tmp/a.toml".to_string(),
+            "config".to_string(),
+            "show".to_string(),
+        ])
+        .unwrap()
+        .config
+        .is_some());
     }
 
     #[test]
@@ -1215,11 +1251,16 @@ mod tests {
             "uninstall".to_string(),
         ])
         .unwrap();
-        assert_eq!(args.command, Some(Command::Service(ServiceAction::Uninstall)));
+        assert_eq!(
+            args.command,
+            Some(Command::Service(ServiceAction::Uninstall))
+        );
         assert_eq!(args.config, Some(PathBuf::from("/tmp/a.toml")));
-        assert!(parse_args(&["reconnect".to_string(), "--portable".to_string()])
-            .unwrap()
-            .portable);
+        assert!(
+            parse_args(&["reconnect".to_string(), "--portable".to_string()])
+                .unwrap()
+                .portable
+        );
 
         assert_eq!(
             parse_args(&["service".to_string()]).unwrap_err(),
@@ -1255,7 +1296,10 @@ mod tests {
     fn a_url_is_still_a_url() {
         let args = parse_args(&["https://h/srun_portal_pc?ac_id=1".to_string()]).unwrap();
         assert_eq!(args.command, None);
-        assert_eq!(args.portal_url.as_deref(), Some("https://h/srun_portal_pc?ac_id=1"));
+        assert_eq!(
+            args.portal_url.as_deref(),
+            Some("https://h/srun_portal_pc?ac_id=1")
+        );
     }
 
     #[test]
@@ -1277,7 +1321,10 @@ mod tests {
     #[test]
     fn the_panel_header_is_centred_like_the_reference() {
         assert_eq!(center("You're online", RULE_WIDTH).len(), RULE_WIDTH);
-        assert_eq!(center("You're online", RULE_WIDTH), "      You're online      ");
+        assert_eq!(
+            center("You're online", RULE_WIDTH),
+            "      You're online      "
+        );
         assert_eq!(RULE_WIDTH, "-------------------------".len());
     }
 }

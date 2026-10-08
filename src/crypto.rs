@@ -64,7 +64,7 @@ pub enum CryptoError {
 /// input length, which the tests check against an independent reference encoder.
 pub fn btoa(input: &[u8], alphabet: &str) -> String {
     let len = input.len();
-    let mut out = String::with_capacity((len + 2) / 3 * 4 + 4);
+    let mut out = String::with_capacity(len.div_ceil(3) * 4 + 4);
     let mut quarter: u64 = 0;
     let mut block: u32 = 0;
     // Once the index is past the end the table is `=` from then on; the loop still has to
@@ -160,10 +160,7 @@ fn to_words(s: &str, with_length: bool) -> Vec<u32> {
 /// `a[i] | a[i+1] << 8 | a[i+2] << 16 | a[i+3] << 24` under JS shift semantics.
 #[inline]
 fn pack_word(units: &[u32; 4]) -> u32 {
-    units[0]
-        | units[1].wrapping_shl(8)
-        | units[2].wrapping_shl(16)
-        | units[3].wrapping_shl(24)
+    units[0] | units[1].wrapping_shl(8) | units[2].wrapping_shl(16) | units[3].wrapping_shl(24)
 }
 
 /// SPEC §6.2 `l(a, b)` with `b == false`: four little-endian bytes per word.
@@ -244,13 +241,11 @@ pub fn xdecode(blob: &[u8], key: &str) -> Result<String, CryptoError> {
     if blob.is_empty() {
         return Ok(String::new());
     }
-    if blob.len() % 4 != 0 {
+    if !blob.len().is_multiple_of(4) {
         return Err(CryptoError::BadLength);
     }
-    let mut v: Vec<u32> = blob
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect();
+    let (chunks, _) = blob.as_chunks::<4>();
+    let mut v: Vec<u32> = chunks.iter().map(|c| u32::from_le_bytes(*c)).collect();
     if v.len() < 2 {
         // A message always contributes at least one payload word plus the length word, so a
         // single-word blob has no length word to validate.
@@ -521,8 +516,11 @@ mod tests {
         assert!(xencode("", TOKEN).is_empty());
         // The key is padded to four words; a longer key must still work.
         assert_eq!(
-            xdecode(&xencode("hello world", "a longer key than four characters"), "a longer key than four characters")
-                .unwrap(),
+            xdecode(
+                &xencode("hello world", "a longer key than four characters"),
+                "a longer key than four characters"
+            )
+            .unwrap(),
             "hello world"
         );
     }
