@@ -760,10 +760,11 @@ mod tests {
 
     #[test]
     fn systemd_units_are_exact() {
-        let plan = systemd::plan(&spec());
-
-        let service = PathBuf::from("/home/u/.config/systemd/user/srun-portal.service");
-        let timer = PathBuf::from("/home/u/.config/systemd/user/srun-portal.timer");
+        let spec = spec();
+        let plan = systemd::plan(&spec);
+        let unit_dir = user_config_dir(&spec).join("systemd").join("user");
+        let service = unit_dir.join("srun-portal.service");
+        let timer = unit_dir.join("srun-portal.timer");
         assert_eq!(
             plan.files,
             vec![
