@@ -38,8 +38,25 @@ launchd 和 Task Scheduler 的实际安装仍需在对应原生系统上检查�
 
 ## 安装
 
-将二进制复制到当前用户拥有且位于 `PATH` 的目录。不要以 root 运行：Portal 会话、
-配置和凭据都属于当前用户。
+将二进制复制到当前用户拥有且位于 `PATH` 的目录。不要以 root 运行：Portal 会话、配置和凭据都属于当前用户。
+
+## 发布命令
+
+发布工作流位于 [`.github/workflows/release.yml`](.github/workflows/release.yml)。
+它只响应 `v*` 标签，分别在 Linux、macOS 和 Windows runner 上构建二进制，
+生成 SHA-256 文件，然后使用 `GITHUB_TOKEN` 创建 GitHub Release 并上传产物。
+
+```text
+git tag -a v0.1.0 -m "srun-portal v0.1.0"
+git push origin v0.1.0
+```
+
+标签推送成功后，Release workflow 会自动发布：
+
+- `srun-portal-v0.1.0-x86_64-unknown-linux-gnu`
+- `srun-portal-v0.1.0-x86_64-apple-darwin`
+- `srun-portal-v0.1.0-x86_64-pc-windows-msvc.exe`
+- 对应的 `.sha256` 校验文件
 
 没有配置文件时，先带 Portal URL 执行一次交互流程：
 

@@ -126,6 +126,7 @@ cargo build --release                       通过
 - [协议保真与验证](docs/protocol.md)
 - [发布与运维](RELEASE.md)
 - [CI 工作流](.github/workflows/ci.yml)
+- [Release CD 工作流](.github/workflows/release.yml)
 
 ## 许可证
 
