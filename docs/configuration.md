@@ -20,9 +20,12 @@
 系统位置，`--portable` 会强制使用便携位置。旧版 `~/.srun_portal.json` 只会
 被读取并作为首次创建时的 `portal_url` 种子，之后不再写入。
 
-Portal URL 的解析优先级是：命令行位置参数、配置文件中的 `portal_url`、交互式
-输入。`config set` / `config unset` 和交互式流程会写入本次解析所使用的文件。
-未知 TOML 键会在重写时保留。
+`network` 必须手动指定为 `office` 或 `dorm`。首次运行或配置文件缺少该项时，
+交互式流程会询问并写回。非交互 `reconnect`/后台任务在缺少 `network` 但已有有效
+`portal_url` 时复用旧配置；只有两者都缺失时才失败。显式 `portal_url` 优先于
+`network`。`/srun_portal...` URL 选择办公区 Srun；根路径 URL 选择 Dr.COM 4.0
+EPortal，例如宿舍区 `http://172.30.255.42/`。`config set` / `config unset` 和
+交互式流程会写入本次解析所使用的文件。未知 TOML 键会在重写时保留。
 
 ## 配置键
 
@@ -30,8 +33,9 @@ Portal URL 的解析优先级是：命令行位置参数、配置文件中的 `p
 
 ```toml
 # srun-portal configuration.
-portal_url = "https://net.szu.edu.cn/srun_portal_pc?ac_id=1"
+network = "office"
 username = "testuser"
+portal_url = "https://net.szu.edu.cn/srun_portal_pc?ac_id=1" # optional override
 domain = "@example"
 callback = "jsonp"
 connect_timeout_ms = 5000
@@ -40,12 +44,21 @@ reconnect_interval_secs = 300
 reconnect_boot_delay_secs = 30
 ```
 
-| 键 | 含义 |
-|---|---|
-| `portal_url` | 完整 Portal URL，必须包含 `/srun_portal...` 路径和 `ac_id` 查询键 |
+宿舍区配置只需替换：
+
+```toml
+portal_url = "http://172.30.255.42/"
+username = "testuser"
+```
+
+Dr.COM 登录会从根页面读取终端 IPv4，从 EPortal 配置读取端口和账号后缀，
+并使用 `user_account`, `user_password`, `wlan_user_ip` 等字段。密码仍由交互输入、
+`SRUN_PORTAL_PASSWORD` 或现有凭据设施提供，配置文件不保存密码。
+
+| `network` | 手动网络模式：`office` 办公区，`dorm` 宿舍区 |
+| `portal_url` | 显式 Srun URL（含 `/srun_portal...` 和 `ac_id`），或 Dr.COM 根 URL；优先级高于 `network` |
 | `username` | 交互式登录和无交互重连接使用的默认账号 |
-| `domain` | 账号没有 `@` 时追加的域名后缀；空值表示不追加 |
-| `callback` | JSONP 回调名，默认 `jsonp` |
+| `domain` | Srun 账号没有 `@` 时追加的域名后缀；Dr.COM 仅使用账号中显式输入的 `@` 后缀 |
 | `connect_timeout_ms` | HTTP 连接超时，默认 5000 ms |
 | `read_timeout_ms` | HTTP 读取超时，默认 10000 ms |
 | `reconnect_interval_secs` | 后台周期检查间隔；`0` 关闭周期任务 |

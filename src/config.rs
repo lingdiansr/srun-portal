@@ -102,6 +102,41 @@ pub struct PortalUrl {
     /// The `ac_id` query value (percent-decoded).
     pub ac_id: String,
 }
+/// A root URL for the Dr.COM 4.0 EPortal used by the dormitory network.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrcomUrl {
+    /// `new URL(raw).origin`, without the root path or query.
+    pub origin: String,
+}
+
+/// A supported portal URL. The path selects the wire protocol.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PortalTarget {
+    Srun(PortalUrl),
+    Drcom(DrcomUrl),
+}
+
+/// Parse either the existing Srun URL shape or a Dr.COM root URL.
+pub fn parse_portal_target(raw: &str) -> Result<PortalTarget, ConfigError> {
+    let cleaned: String = raw
+        .trim_matches(|c: char| c.is_ascii_control() || c == ' ')
+        .chars()
+        .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+        .collect();
+    if cleaned.is_empty() {
+        return Err(ConfigError::PortalUrlRequired);
+    }
+    let parts = split_absolute_url(&cleaned).ok_or(ConfigError::PortalUrlInvalid)?;
+    if parts.pathname.starts_with("/srun_portal") {
+        return parse_portal_url(&cleaned).map(PortalTarget::Srun);
+    }
+    if parts.pathname == "/" && parts.query.is_empty() {
+        return Ok(PortalTarget::Drcom(DrcomUrl {
+            origin: parts.origin,
+        }));
+    }
+    Err(ConfigError::PortalUrlInvalid)
+}
 
 /// Validate a portal URL the way `CLI.start()` does (SPEC §3.1): it must parse
 /// as an absolute URL, its `pathname` must start with `/srun_portal`, and it

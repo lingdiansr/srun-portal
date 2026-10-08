@@ -19,11 +19,11 @@
 - `crypto`：变体 Base64、Srun 的 XXTEA `XEncode`、HMAC-MD5、SHA-1、`{SRBX1}` 信息块。
 - `transport`：`URLSearchParams` 编码、JSONP、HTTP 超时、双栈端点切换。
 - `html` / `portal_config`：解析配置页中所需的 `$('#id').html()` 子集。
-- `api`：配置页、在线检查、challenge、登录、普通登出、DM 登出、短信访客接口。
-- `runtime`：在线检查、重试、双栈认证和登出状态机。
+- `drcom`：Dr.COM 根页面终端信息、EPortal 配置、状态、登录和注销。
+- `api`：Srun 配置页、在线检查、challenge、登录、普通登出、DM 登出、短信访客接口。
+- `runtime`：Srun 在线检查、重试、双栈认证和登出状态机。
 - `translate`：错误码到文本的分派算法。
-- `config` / `settings`：旧 JSON 只读兼容、TOML 配置发现、分层和首次创建。
-- `reconnect` / `service`：无交互一次性重连接和各平台调度器。
+- `config` / `settings`：协议 URL 识别、network 手动配置、旧 JSON 只读兼容、TOML 配置发现、分层和首次创建。
 
 ## 已确认的保真行为
 
@@ -63,7 +63,6 @@
 
 - 网卡绑定（`SO_BINDTODEVICE`）
 - 显式认证服务器 IP 覆盖
-- dorm `eportal` 协议族
 - User-Agent 伪装
 - captcha 探测
 - 常驻 monitor/reconnect daemon
@@ -79,7 +78,7 @@
 ```text
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
-cargo test --all-targets       # 153 passed
+cargo test --all-targets       # 162 passed
 cargo build --release
 ```
 
@@ -96,7 +95,7 @@ cargo build --release
 
 ### Stub portal 流程
 
-`tests/flow.rs` 使用标准库实现本地 stub portal，覆盖：
+`tests/flow.rs` 使用标准库实现本地 Srun stub portal，覆盖：
 
 - 配置页 → 在线检查 → challenge → 登录 → 在线复查 → DM 登出
 - 三次在线检查后的失败路径
@@ -107,6 +106,14 @@ cargo build --release
 - systemd、launchd、Task Scheduler 产物和命令行参数
 - 配置分层、凭据设施和 `0600` 文件回退
 
+`tests/drcom.rs` 使用标准库实现 Dr.COM stub，覆盖：
+
+- 根页面终端 IP/端口和 EPortal 配置 JSONP
+- `chkstatus` 离线/在线检查
+- 登录和注销 JSONP 请求
+- Srun/Dr.COM URL 自动识别
+
+
 ### 差分验证
 
 差分验证需要外部参考二进制和一个记录原始 query 的 stub portal。相同输入下，
@@ -115,12 +122,21 @@ cargo build --release
 
 ### 真实 Portal 只读检查
 
+办公区 Srun：
+
 ```text
-cargo run --example live_check -- <portal-url> [username]
+cargo run --example live_check -- <srun-portal-url> [username]
 ```
 
-该命令只读取配置页、challenge 和在线信息，不执行登录、登出，也不创建配置文件。
-它需要可访问的真实 Portal，因此属于手工验证；CI 仅负责编译和 CLI smoke check。
+宿舍区 Dr.COM 只读 smoke：
+
+```text
+printf 'N\n' | cargo run -- --config /tmp/srun-portal-dorm-smoke.toml
+```
+
+`network` 必须手动设置为 `office` 或 `dorm`；缺少时交互式流程会询问，非交互
+流程在已有有效 `portal_url` 时复用旧配置，否则失败。该命令只读取门户配置和在线
+状态，不执行登录、登出或读取密码；CI 仅负责编译和 stub 测试。
 
 ## Clean-room 说明
 

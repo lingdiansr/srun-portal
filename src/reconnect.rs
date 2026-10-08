@@ -13,6 +13,7 @@
 
 use crate::api;
 use crate::config;
+use crate::drcom::DrcomClient;
 use crate::portal_config::{self, ConfigError};
 use crate::runtime::{PortalError, Runtime, RuntimeOptions};
 use crate::sys;
@@ -23,7 +24,7 @@ use crate::transport;
 /// configuration file.
 #[derive(Debug, Clone)]
 pub struct Target {
-    pub portal: config::PortalUrl,
+    pub portal: config::PortalTarget,
     pub username: String,
     /// As `authByPassword` wants it: empty, or `@domain` ([`domain_arg`]).
     pub domain: String,
@@ -47,24 +48,38 @@ pub enum Outcome {
 /// so the caller never formats a [`PortalError`] itself and no error message is
 /// invented here.
 pub fn reconnect_once(target: &Target, password: &str) -> Result<Outcome, String> {
-    let cfg = fetch_config(&target.portal)?;
-    let mut options =
-        RuntimeOptions::from_config(&cfg, &target.portal.origin, &host_of(&target.portal.origin));
-    options.callback = target.callback.clone();
-    let mut runtime = Runtime::new(options);
-    runtime.apply_interface_correction(&sys::network_interfaces(), &cfg.ip);
-    runtime.spawn_other_stack_probe();
+    match &target.portal {
+        config::PortalTarget::Srun(portal) => {
+            let cfg = fetch_config(portal)?;
+            let mut options =
+                RuntimeOptions::from_config(&cfg, &portal.origin, &host_of(&portal.origin));
+            options.callback = target.callback.clone();
+            let mut runtime = Runtime::new(options);
+            runtime.apply_interface_correction(&sys::network_interfaces(), &cfg.ip);
+            runtime.spawn_other_stack_probe();
 
-    if runtime
-        .check_online()
-        .map_err(|err| err.render(&runtime.translate))?
-    {
-        return Ok(Outcome::AlreadyOnline);
+            if runtime
+                .check_online()
+                .map_err(|err| err.render(&runtime.translate))?
+            {
+                return Ok(Outcome::AlreadyOnline);
+            }
+            runtime
+                .auth_by_password(&target.username, password, &target.domain)
+                .map_err(|err| err.render(&runtime.translate))?;
+            Ok(Outcome::Reconnected)
+        }
+        config::PortalTarget::Drcom(portal) => {
+            let client = DrcomClient::new(portal).map_err(|err| err.to_string())?;
+            if client.check_online().map_err(|err| err.to_string())? {
+                return Ok(Outcome::AlreadyOnline);
+            }
+            client
+                .login(&target.username, password, "")
+                .map_err(|err| err.to_string())?;
+            Ok(Outcome::Reconnected)
+        }
     }
-    runtime
-        .auth_by_password(&target.username, password, &target.domain)
-        .map_err(|err| err.render(&runtime.translate))?;
-    Ok(Outcome::Reconnected)
 }
 
 /// SPEC §3.2/§5: `GET {origin}/srun_portal_pc?ac_id=<url ac_id>&theme=app`, then

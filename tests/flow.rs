@@ -496,7 +496,9 @@ fn endpoints_keep_the_stub_port_for_both_stacks() {
 fn target(stub: &Stub) -> srun_portal::reconnect::Target {
     let slug = format!("{}/srun_portal_pc?ac_id=1", stub.origin);
     srun_portal::reconnect::Target {
-        portal: srun_portal::config::parse_portal_url(&slug).expect("valid slug"),
+        portal: srun_portal::config::PortalTarget::Srun(
+            srun_portal::config::parse_portal_url(&slug).expect("valid slug"),
+        ),
         username: "testuser".to_string(),
         domain: String::new(),
         callback: api::DEFAULT_CALLBACK.to_string(),

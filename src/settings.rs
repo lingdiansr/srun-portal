@@ -43,7 +43,8 @@ pub const ENV_CONFIG_PATH: &str = "SRUN_PORTAL_CONFIG";
 const HEADER: &str = "\
 # srun-portal configuration.
 # Every key is optional; unknown keys are preserved across rewrites.
-#   portal_url          full portal URL, e.g. \"https://net.szu.edu.cn/srun_portal_pc?ac_id=1\"
+#   portal_url          full portal URL, or empty when `network` selects one
+#   network             office or dorm; missing asks in interactive mode
 #   username            account name used as the default for the login prompt
 #   domain              domain suffix used when the account carries none (with or
 #                       without '@'; empty or unset means no suffix, which is what
@@ -82,6 +83,7 @@ pub enum Storage {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Settings {
     pub portal_url: Option<String>,
+    pub network: Option<String>,
     pub username: Option<String>,
     pub domain: Option<String>,
     pub callback: Option<String>,
@@ -102,6 +104,7 @@ impl Settings {
     fn documented_defaults() -> Settings {
         Settings {
             portal_url: None,
+            network: None,
             username: None,
             domain: Some(String::new()),
             callback: None,
@@ -117,6 +120,9 @@ impl Settings {
         let mut pairs = Vec::new();
         if let Some(value) = &self.portal_url {
             pairs.push(("portal_url", Value::String(value.clone())));
+        }
+        if let Some(value) = &self.network {
+            pairs.push(("network", Value::String(value.clone())));
         }
         if let Some(value) = &self.username {
             pairs.push(("username", Value::String(value.clone())));
@@ -147,6 +153,7 @@ impl Settings {
     fn from_table(table: &toml::Table, path: &Path) -> Result<Settings, ConfigError> {
         Ok(Settings {
             portal_url: optional_string(table, "portal_url", path)?,
+            network: optional_string(table, "network", path)?,
             username: optional_string(table, "username", path)?,
             domain: optional_string(table, "domain", path)?,
             callback: optional_string(table, "callback", path)?,
@@ -318,6 +325,11 @@ pub const KEY_CATALOGUE: &[KeySpec] = &[
         about: "full portal URL used when no argument is given",
     },
     KeySpec {
+        name: "network",
+        kind: KeyKind::Str,
+        about: "network mode: office or dorm",
+    },
+    KeySpec {
         name: "username",
         kind: KeyKind::Str,
         about: "account used as the default for the login prompt",
@@ -369,6 +381,9 @@ pub fn parse_key_value(key: &str, text: &str) -> Result<Value, String> {
     let Some(spec) = key_spec(key) else {
         return Err(format!("Unknown configuration key: {key}"));
     };
+    if key == "network" && !matches!(text, "office" | "dorm") {
+        return Err("key \"network\" must be one of: office, dorm".to_string());
+    }
     match spec.kind {
         KeyKind::Str => Ok(Value::String(text.to_string())),
         KeyKind::Count => match text.parse::<u64>() {
@@ -426,6 +441,7 @@ impl ConfigFile {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Effective {
     pub portal_url: Option<String>,
+    pub network: Option<String>,
     pub username: Option<String>,
     pub domain: Option<String>,
     /// Never empty: [`crate::api::DEFAULT_CALLBACK`] when no file sets it.
@@ -435,10 +451,9 @@ pub struct Effective {
     /// installed task does not run on an interval (`reconnect_interval_secs`
     /// unset or `0`, which is the default).
     pub reconnect_interval_secs: Option<u64>,
-    /// Seconds after startup before the first background check; `None` means it
-    /// does not run at startup (`reconnect_boot_delay_secs` unset or `0`, which
-    /// is the default). Both unset leaves a task that only runs when started by
-    /// hand.
+    /// Seconds after startup before the first check; `None` means it does not
+    /// run at startup (`reconnect_boot_delay_secs` unset or `0`, which is the
+    /// default). Both unset leaves a task that only runs when started by hand.
     pub reconnect_boot_delay_secs: Option<u64>,
 }
 
@@ -447,6 +462,7 @@ impl Effective {
     fn layered(layers: &[&Settings]) -> Effective {
         let mut effective = Effective {
             portal_url: None,
+            network: None,
             username: None,
             domain: None,
             callback: crate::api::DEFAULT_CALLBACK.to_string(),
@@ -459,6 +475,7 @@ impl Effective {
         };
         for layer in layers {
             overlay(&mut effective.portal_url, &layer.portal_url);
+            overlay(&mut effective.network, &layer.network);
             overlay(&mut effective.username, &layer.username);
             overlay(&mut effective.domain, &layer.domain);
             if let Some(callback) = &layer.callback {

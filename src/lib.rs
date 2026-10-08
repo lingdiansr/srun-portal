@@ -46,9 +46,11 @@ pub mod cli;
 pub mod config;
 pub mod credentials;
 pub mod crypto;
+pub mod drcom;
 pub mod format;
 pub mod html;
 pub mod keyring;
+pub mod network;
 pub mod portal_config;
 pub mod reconnect;
 pub mod runtime;
@@ -73,6 +75,8 @@ pub mod messages {
     pub const BANNER: &str = " Srun Network Auth ";
     /// Raised when a command that cannot ask for one finds no account.
     pub const USERNAME_REQUIRED: &str = "Username is required for an unattended reconnect!";
+    /// Raised when the unattended path has no manually selected network.
+    pub const NETWORK_REQUIRED: &str = "Network is required: set network to office or dorm";
     /// Raised when the unattended path has no password from any source.
     pub const PASSWORD_REQUIRED: &str =
         "No stored password: run `srun-portal service install` or set SRUN_PORTAL_PASSWORD";

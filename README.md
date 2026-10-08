@@ -15,12 +15,15 @@ stub portal 流程测试和差分验证约束。
 ```text
 cargo build --release
 ./target/release/srun-portal 'https://net.szu.edu.cn/srun_portal_pc?ac_id=1'
+./target/release/srun-portal 'http://172.30.255.42/'
 cargo run --example live_check -- 'https://net.szu.edu.cn/srun_portal_pc?ac_id=1' [username]
 cargo test --all-targets
 ```
 
 Portal URL 的解析顺序为：命令行位置参数、配置文件中的 `portal_url`、交互式
-输入。`live_check` 只执行只读请求，不会登录、登出或写入配置。
+输入。`/srun_portal...` URL 使用办公区 Srun 协议；根路径 URL（例如宿舍区
+`http://172.30.255.42/`）自动使用 Dr.COM 4.0 EPortal 协议。`live_check` 只
+执行 Srun 只读请求，不会登录、登出或写入配置。
 
 ## CLI
 
@@ -60,30 +63,37 @@ srun-portal [options] config show|list|set|unset
 最小配置示例：
 
 ```toml
-portal_url = "https://net.szu.edu.cn/srun_portal_pc?ac_id=1"
+network = "office" # office or dorm
 username = "testuser"
+# portal_url = "https://net.szu.edu.cn/srun_portal_pc?ac_id=1" # optional override
 # domain = "@example"
 # callback = "jsonp"
 # connect_timeout_ms = 5000
 # read_timeout_ms = 10000
 ```
 
+首次运行或配置文件缺少 `network` 时，交互式 CLI 会询问网络区域并写回配置。
+网络模式必须手动指定为 `office` 或 `dorm`；显式 `portal_url` 仍优先于 `network`。
+
+宿舍区 Dr.COM 使用配置页返回的终端 IPv4 和 EPortal 端口，账号字段为门户要求的
+`,0,<账号>` 形式，密码仅在请求期间使用。办公区和宿舍区共用同一套账号、密码存储
+和 `reconnect`/后台任务流程。
+
 后台任务始终以当前用户身份运行。密码优先保存到操作系统凭据设施；没有可用
 凭据设施时，才回退到配置目录旁、权限为 `0600` 的凭据文件。
 
 ## 代码结构
 
-| 模块 | 职责 |
-|---|---|
 | `crypto` | 变体 Base64、XXTEA、HMAC-MD5、SHA-1、`{SRBX1}` 信息块 |
 | `transport` | URL 编码、JSONP、HTTP 超时、双栈端点 |
 | `html` / `portal_config` | 解析 Portal 配置页和 `PortalFlags` |
+| `drcom` | Dr.COM 根页面、EPortal 配置、状态、登录和注销 |
 | `api` | 构造并发送各 Portal API 请求 |
-| `runtime` | 在线检查、登录、双栈和登出状态机 |
-| `config` / `settings` | 旧 JSON 读取、TOML 配置发现、分层和首次创建 |
+| `runtime` | Srun 在线检查、登录、双栈和登出状态机 |
+| `network` | 手动指定办公区或宿舍区网络模式 |
+| `config` / `settings` | URL 协议识别、network 配置、旧 JSON 读取、TOML 配置发现和分层 |
 | `credentials` / `keyring` | 凭据设施和 `0600` 文件回退 |
 | `reconnect` / `service` | 无交互重连接和平台后台任务 |
-| `cli` / `sys` | 交互式命令行、系统探测和输入处理 |
 
 `src/main.rs` 是命令行入口；`examples/live_check.rs` 是只读实时检查入口。
 
@@ -94,7 +104,7 @@ username = "testuser"
 ```text
 cargo fmt --all -- --check                 通过
 cargo clippy --all-targets -- -D warnings  通过
-cargo test --all-targets                    153 passed
+cargo test --all-targets                    162 passed
 cargo build --release                       通过
 ```
 
@@ -104,14 +114,13 @@ cargo build --release                       通过
 
 ## 项目边界
 
-已实现：标准 Portal PC 流程、双栈探测、JSONP API、交互登录、DM 登出、一次性
-后台重连接、三类平台任务和多种凭据后端。
+已实现：标准 Srun Portal 流程、Dr.COM 4.0 EPortal 流程、双栈探测、JSONP API、
+交互登录、登出、一次性后台重连接、三类平台任务和多种凭据后端。
 
 明确不在当前协议范围内：
 
 - 网卡绑定（`SO_BINDTODEVICE`）
 - 显式认证服务器 IP 覆盖
-- dorm `eportal` 协议
 - User-Agent 伪装
 - captcha 探测
 - 常驻重连接 daemon

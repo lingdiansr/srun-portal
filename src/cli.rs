@@ -15,8 +15,10 @@
 use crate::api;
 use crate::config;
 use crate::credentials;
+use crate::drcom::DrcomClient;
 use crate::format;
 use crate::keyring;
+use crate::network::{self, NetworkMode};
 use crate::reconnect::{self, domain_arg, fetch_config, host_of};
 use crate::runtime::{Runtime, RuntimeOptions};
 use crate::service;
@@ -216,17 +218,35 @@ pub fn run(argv: Vec<String>) -> i32 {
     // One-shot: the agent reads these when it is first built. Failing means the
     // timeouts were already fixed, which is not an error here.
     let _ = transport::set_timeouts(resolution.effective.timeouts);
+    if let Err(status) = ensure_network_setting(&mut resolution) {
+        return status;
+    }
+    let persist_portal = should_persist_portal(&args, &resolution);
 
     let slug = match resolve_slug(&args, &resolution) {
         Ok(slug) => slug,
         Err(status) => return status,
     };
-    let portal = match config::parse_portal_url(&slug) {
-        Ok(url) => url,
+    let target = match config::parse_portal_target(&slug) {
+        Ok(target) => target,
         Err(err) => {
             eprintln!("{err}");
             return 1;
         }
+    };
+    if let config::PortalTarget::Drcom(portal) = &target {
+        if persist_portal {
+            if let Some(base) = resolution.base.as_mut() {
+                if let Err(err) = base.update(&[("portal_url", toml::Value::String(slug.clone()))])
+                {
+                    eprintln!("{err}");
+                }
+            }
+        }
+        return run_drcom_interactive(portal, &resolution);
+    }
+    let config::PortalTarget::Srun(portal) = target else {
+        unreachable!("Dr.COM target returned above");
     };
 
     let cfg = match fetch_config(&portal) {
@@ -239,15 +259,17 @@ pub fn run(argv: Vec<String>) -> i32 {
 
     // The configured URL is what the next run reads first, so it is recorded in
     // the file that was read first: the project file, or the system one.
-    if let Some(base) = resolution.base.as_mut() {
-        let slug = format!(
-            "{}{}?ac_id={}",
-            portal.origin,
-            api::CONFIG_PATHNAME,
-            portal.ac_id
-        );
-        if let Err(err) = base.update(&[("portal_url", toml::Value::String(slug))]) {
-            eprintln!("{err}");
+    if persist_portal {
+        if let Some(base) = resolution.base.as_mut() {
+            let slug = format!(
+                "{}{}?ac_id={}",
+                portal.origin,
+                api::CONFIG_PATHNAME,
+                portal.ac_id
+            );
+            if let Err(err) = base.update(&[("portal_url", toml::Value::String(slug))]) {
+                eprintln!("{err}");
+            }
         }
     }
 
@@ -316,6 +338,68 @@ pub fn run(argv: Vec<String>) -> i32 {
                 return 0;
             }
             Err(err) => println!("Auth failed: {}", err.render(&runtime.translate)),
+        }
+    }
+}
+
+fn run_drcom_interactive(portal: &config::DrcomUrl, resolution: &settings::Resolution) -> i32 {
+    let client = match DrcomClient::new(portal) {
+        Ok(client) => client,
+        Err(err) => {
+            eprintln!("{err}");
+            return 1;
+        }
+    };
+    let online = match client.check_online() {
+        Ok(online) => online,
+        Err(err) => {
+            eprintln!("{err}");
+            return 1;
+        }
+    };
+    if online {
+        match confirm("Do you want to sign out? (y/N): ") {
+            Ok(true) => match client.logout() {
+                Ok(()) => println!("Sign out success!"),
+                Err(err) => println!("SignOut failed: {err}"),
+            },
+            Ok(false) => {}
+            Err(err) => {
+                eprintln!("{err}");
+                return 1;
+            }
+        }
+        return 0;
+    }
+
+    loop {
+        let label = match resolution.effective.username.as_deref() {
+            Some(username) if !username.is_empty() => {
+                format!("Please enter your username [{username}]: ")
+            }
+            _ => "Please enter your username: ".to_string(),
+        };
+        let entered = match prompt(&label) {
+            Ok(value) => value,
+            Err(status) => return status,
+        };
+        let username = if entered.trim().is_empty() {
+            resolution.effective.username.clone().unwrap_or_default()
+        } else {
+            entered
+        };
+        let password = match password_prompt() {
+            Ok(value) => value,
+            Err(status) => return status,
+        };
+        let (account, typed_domain) = split_domain(&username);
+        let domain = typed_domain;
+        match client.login(&account, &password, &domain) {
+            Ok(()) => {
+                println!("Auth Success!");
+                return 0;
+            }
+            Err(err) => println!("Auth failed: {err}"),
         }
     }
 }
@@ -424,6 +508,10 @@ fn effective_value(effective: &settings::Effective, key: &str) -> String {
             .portal_url
             .clone()
             .unwrap_or_else(|| "(not set)".into()),
+        "network" => effective
+            .network
+            .clone()
+            .unwrap_or_else(|| "(not set: asks interactively)".into()),
         "username" => effective
             .username
             .clone()
@@ -539,16 +627,30 @@ fn run_reconnect(args: &Args) -> i32 {
 }
 
 /// The configured portal URL, validated. `Err` is the exit status.
-fn configured_portal(effective: &settings::Effective) -> Result<config::PortalUrl, i32> {
-    let slug = match effective.portal_url.as_deref() {
-        Some(slug) if !slug.is_empty() => slug,
-        _ => {
-            eprintln!("{}", crate::messages::PORTAL_URL_REQUIRED);
-            return Err(1);
-        }
+fn configured_portal(effective: &settings::Effective) -> Result<config::PortalTarget, i32> {
+    if let Some(slug) = effective
+        .portal_url
+        .as_deref()
+        .filter(|slug| !slug.is_empty())
+    {
+        return config::parse_portal_target(slug).map_err(|err| {
+            eprintln!("{err}");
+            1
+        });
+    }
+    network::select_target(network_mode(effective)?).map_err(|error| {
+        eprintln!("{error}");
+        1
+    })
+}
+
+fn network_mode(effective: &settings::Effective) -> Result<NetworkMode, i32> {
+    let Some(value) = effective.network.as_deref() else {
+        eprintln!("{}", crate::messages::NETWORK_REQUIRED);
+        return Err(1);
     };
-    config::parse_portal_url(slug).map_err(|err| {
-        eprintln!("{err}");
+    NetworkMode::parse(value).map_err(|error| {
+        eprintln!("{error}");
         1
     })
 }
@@ -831,6 +933,40 @@ fn credentials_status(resolution: &settings::Resolution, config: &std::path::Pat
     format!("none stored for {account}{reason}")
 }
 
+fn ensure_network_setting(resolution: &mut settings::Resolution) -> Result<(), i32> {
+    if let Some(value) = resolution.effective.network.as_deref() {
+        if NetworkMode::parse(value).is_ok() {
+            return Ok(());
+        }
+        eprintln!("Invalid network setting {value:?}; choose office or dorm.");
+    }
+    loop {
+        let input = prompt("Network [office/dorm]: ")?;
+        if input.trim().is_empty() {
+            eprintln!("{}", crate::messages::NETWORK_REQUIRED);
+            continue;
+        }
+        match NetworkMode::parse(input.trim()) {
+            Ok(mode) => {
+                record_setting(resolution, "network", network_mode_name(mode))?;
+                return Ok(());
+            }
+            Err(error) => eprintln!("{error}"),
+        }
+    }
+}
+
+fn network_mode_name(mode: NetworkMode) -> &'static str {
+    match mode {
+        NetworkMode::Office => "office",
+        NetworkMode::Dorm => "dorm",
+    }
+}
+
+fn should_persist_portal(args: &Args, resolution: &settings::Resolution) -> bool {
+    args.portal_url.is_some() || resolution.effective.portal_url.is_some()
+}
+
 /// Fill in `portal_url` and `username` when the task could not work without
 /// them, prompting exactly once each.
 ///
@@ -843,24 +979,39 @@ fn ensure_unattended_settings(resolution: &mut settings::Resolution) -> Result<(
         .effective
         .portal_url
         .as_deref()
-        .is_some_and(|slug| config::parse_portal_url(slug).is_ok());
+        .is_some_and(|slug| config::parse_portal_target(slug).is_ok());
+    let network_missing = match resolution.effective.network.as_deref() {
+        Some(value) => NetworkMode::parse(value).is_err(),
+        None => true,
+    };
+    if network_missing && !has_portal {
+        if !sys::stdin_is_tty() {
+            eprintln!("{}", crate::messages::NETWORK_REQUIRED);
+            return Err(1);
+        }
+        ensure_network_setting(resolution)?;
+    }
+
     if !has_portal {
         if !sys::stdin_is_tty() {
-            eprintln!("{}", crate::messages::PORTAL_URL_REQUIRED);
+            eprintln!("{}", crate::messages::PORTAL_URL_INVALID);
             return Err(1);
         }
         let stored = loop {
             match prompt("Portal web url: ") {
-                Ok(input) if !input.trim().is_empty() => match config::parse_portal_url(&input) {
-                    Ok(_) => break input,
-                    Err(err) => eprintln!("{err}"),
-                },
+                Ok(input) if !input.trim().is_empty() => {
+                    match config::parse_portal_target(&input) {
+                        Ok(_) => break input,
+                        Err(err) => eprintln!("{err}"),
+                    }
+                }
                 Ok(_) => eprintln!("{}", crate::messages::PORTAL_URL_REQUIRED),
                 Err(status) => return Err(status),
             }
         };
         record_setting(resolution, "portal_url", &stored)?;
     }
+
     let has_username = resolution
         .effective
         .username
@@ -901,6 +1052,7 @@ fn record_setting(
     }
     match key {
         "portal_url" => resolution.effective.portal_url = Some(value.to_string()),
+        "network" => resolution.effective.network = Some(value.to_string()),
         "username" => resolution.effective.username = Some(value.to_string()),
         other => {
             eprintln!("Internal error: {other} is not a promptable key");
@@ -973,7 +1125,7 @@ fn install_password(account: &str, config: Option<&std::path::Path>) -> Result<S
 /// file).
 fn resolve_slug(args: &Args, resolution: &settings::Resolution) -> Result<String, i32> {
     if let Some(argument) = args.portal_url.as_deref() {
-        return match config::parse_portal_url(argument) {
+        return match config::parse_portal_target(argument) {
             Ok(_) => Ok(argument.to_string()),
             Err(err) => {
                 eprintln!("{err}");
@@ -982,10 +1134,12 @@ fn resolve_slug(args: &Args, resolution: &settings::Resolution) -> Result<String
         };
     }
     if let Some(slug) = resolution.effective.portal_url.as_deref() {
-        match config::parse_portal_url(slug) {
+        match config::parse_portal_target(slug) {
             Ok(_) => return Ok(slug.to_string()),
             Err(err) => eprintln!("{err}"),
         }
+    } else {
+        return Ok(network::select_slug(network_mode(&resolution.effective)?).to_string());
     }
     loop {
         let input = match sys::prompt_line("Portal web url: ") {
@@ -1003,7 +1157,7 @@ fn resolve_slug(args: &Args, resolution: &settings::Resolution) -> Result<String
             eprintln!("{}", crate::messages::PORTAL_URL_REQUIRED);
             continue;
         }
-        match config::parse_portal_url(&input) {
+        match config::parse_portal_target(&input) {
             Ok(_) => return Ok(input),
             Err(err) => eprintln!("{err}"),
         }
