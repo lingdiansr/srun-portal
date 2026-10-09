@@ -8,7 +8,7 @@
 //! the two share [`Runtime`], so the wire contract is the same by construction.
 //!
 //! The pieces the interactive shell also needs at the same points
-//! ([`fetch_config`], [`host_of`], [`domain_arg`]) live here and are used from
+//! ([`fetch_config`], [`host_of`]) live here and are used from
 //! [`crate::cli`].
 
 use crate::api;
@@ -25,8 +25,9 @@ use crate::transport;
 pub struct Target {
     pub portal: config::PortalUrl,
     pub username: String,
-    /// As `authByPassword` wants it: empty, or `@domain` ([`domain_arg`]).
+    /// As `authByPassword` wants it: empty, or `@domain`.
     pub domain: String,
+    /// Legacy configuration compatibility; new files always use `jsonp`.
     pub callback: String,
 }
 
@@ -98,36 +99,16 @@ pub fn host_of(origin: &str) -> String {
         .to_string()
 }
 
-/// The configured domain as `authByPassword` wants it: with its `@`, because a
-/// domain without one is rejected (SPEC §10's `Domain must start with @`).
-pub fn domain_arg(domain: Option<&str>) -> String {
-    match domain {
-        Some(domain) if !domain.is_empty() => {
-            if domain.starts_with('@') {
-                domain.to_string()
-            } else {
-                format!("@{domain}")
-            }
-        }
-        _ => String::new(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn domain_arg_gains_its_at_sign() {
-        assert_eq!(domain_arg(None), "");
-        assert_eq!(domain_arg(Some("")), "");
-        assert_eq!(domain_arg(Some("szu")), "@szu");
-        assert_eq!(domain_arg(Some("@szu")), "@szu");
-    }
-
-    #[test]
-    fn host_of_keeps_the_port() {
-        assert_eq!(host_of("http://127.0.0.1:8899"), "127.0.0.1:8899");
-        assert_eq!(host_of("https://net.szu.edu.cn"), "net.szu.edu.cn");
+    fn host_includes_port_but_not_path() {
+        assert_eq!(
+            host_of("https://example.test:8443/path"),
+            "example.test:8443"
+        );
+        assert_eq!(host_of("example.test"), "example.test");
     }
 }

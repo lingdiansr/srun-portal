@@ -59,6 +59,14 @@ impl Store {
     }
 }
 
+/// Where a credential was found for status reporting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Status {
+    Keyring,
+    File,
+    Missing { keyring_unavailable: Option<String> },
+}
+
 /// The credentials file that belongs to `config`: same directory, so
 /// `--config /etc/srun-portal/srun-portal.toml` keeps its secret beside it.
 pub fn path_for(config: &Path) -> PathBuf {
@@ -69,18 +77,19 @@ pub fn path_for(config: &Path) -> PathBuf {
     dir.join(CREDENTIALS_FILE_NAME)
 }
 
-/// Keep `password` for `account`, preferring the credential facility.
+/// Keep `password` for the opaque `account_key`, preferring the credential
+/// facility.
 ///
 /// A facility failure is not fatal: the file takes over and the error is
 /// returned alongside the store that was actually used. Returns `(store, note)`
 /// where `note` explains the fallback, for the caller to print.
 pub fn store(
-    account: &str,
+    account_key: &str,
     password: &str,
     path: &Path,
 ) -> Result<(Store, Option<String>), String> {
     match keyring::availability() {
-        keyring::Availability::Ready => match keyring::store(account, password) {
+        keyring::Availability::Ready => match keyring::store(account_key, password) {
             Ok(()) => Ok((Store::Keyring, None)),
             Err(err) => {
                 write_file(path, password)
@@ -106,10 +115,10 @@ pub fn store(
     }
 }
 
-/// The stored password for `account`: the facility first, then the fallback file
-/// at `path`. `None` when neither holds one.
-pub fn read(account: &str, path: &Path) -> Result<Option<String>, ConfigError> {
-    match keyring::read(account) {
+/// The stored password for opaque `account_key`: the facility first, then the
+/// fallback file at `path`. `None` when neither holds one.
+pub fn read(account_key: &str, path: &Path) -> Result<Option<String>, ConfigError> {
+    match keyring::read(account_key) {
         Ok(Some(password)) => return Ok(Some(password)),
         Ok(None) => {}
         // A broken facility must not hide a perfectly good file, but it is worth
@@ -119,9 +128,9 @@ pub fn read(account: &str, path: &Path) -> Result<Option<String>, ConfigError> {
     read_file(path)
 }
 
-/// Forget `account` everywhere it is kept. Returns whether anything was.
-pub fn revoke(account: &str, path: &Path) -> Result<bool, String> {
-    let from_keyring = match keyring::delete(account) {
+/// Forget opaque `account_key` everywhere it is kept. Returns whether anything was.
+pub fn revoke(account_key: &str, path: &Path) -> Result<bool, String> {
+    let from_keyring = match keyring::delete(account_key) {
         Ok(found) => found,
         Err(err) => {
             eprintln!("Cannot use the system keyring: {err}");
@@ -134,6 +143,23 @@ pub fn revoke(account: &str, path: &Path) -> Result<bool, String> {
         Err(err) => return Err(format!("{}: {err}", path.display())),
     };
     Ok(from_keyring || from_file)
+}
+
+/// Inspect the preferred credential sources without surfacing read failures.
+pub(crate) fn status(account_key: &str, path: &Path) -> Status {
+    if keyring::read(account_key).ok().flatten().is_some() {
+        return Status::Keyring;
+    }
+    if read_file(path).ok().flatten().is_some() {
+        return Status::File;
+    }
+    let keyring_unavailable = match keyring::availability() {
+        keyring::Availability::Ready => None,
+        keyring::Availability::Unavailable(reason) => Some(reason),
+    };
+    Status::Missing {
+        keyring_unavailable,
+    }
 }
 
 /// Write the fallback file, private from the start.
@@ -318,11 +344,15 @@ mod tests {
     fn store_read_and_revoke_use_the_best_available_store() {
         let dir = TempDir::new("stores");
         let path = dir.path().join(CREDENTIALS_FILE_NAME);
-        let account = format!("srun-portal-store-test-{}", std::process::id());
+        let account_key = format!(
+            "srun-portal-store-test-{}@example-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        );
         // A leftover from an interrupted run must not decide the outcome.
-        let _ = revoke(&account, &path);
+        let _ = revoke(&account_key, &path);
 
-        let (chosen, note) = store(&account, "testpass", &path).unwrap();
+        let (chosen, note) = store(&account_key, "testpass", &path).unwrap();
         match chosen {
             Store::Keyring => assert_eq!(note, None, "the keyring needed no fallback"),
             Store::File => {
@@ -331,16 +361,22 @@ mod tests {
                 assert!(path.exists(), "the fallback wrote the file");
             }
         }
-        assert_eq!(read(&account, &path).unwrap().as_deref(), Some("testpass"));
+        assert_eq!(
+            read(&account_key, &path).unwrap().as_deref(),
+            Some("testpass")
+        );
 
         // Replacing in place, not appending a second entry.
-        let _ = store(&account, "second", &path).unwrap();
-        assert_eq!(read(&account, &path).unwrap().as_deref(), Some("second"));
+        let _ = store(&account_key, "second", &path).unwrap();
+        assert_eq!(
+            read(&account_key, &path).unwrap().as_deref(),
+            Some("second")
+        );
 
-        assert!(revoke(&account, &path).unwrap(), "something was stored");
-        assert_eq!(read(&account, &path).unwrap(), None);
+        assert!(revoke(&account_key, &path).unwrap(), "something was stored");
+        assert_eq!(read(&account_key, &path).unwrap(), None);
         assert!(!path.exists(), "the fallback file is gone too");
-        assert!(!revoke(&account, &path).unwrap(), "and nothing is left");
+        assert!(!revoke(&account_key, &path).unwrap(), "and nothing is left");
     }
 
     /// A file left behind while the keyring holds the password is still cleared

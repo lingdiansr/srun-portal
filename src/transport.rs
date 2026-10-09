@@ -12,12 +12,9 @@ use std::fmt;
 use std::sync::{LazyLock, OnceLock};
 use std::time::Duration;
 
-/// The HTTP timeouts, in milliseconds.
-///
-/// The specification fixes none; these are this client's own choice, exposed so
-/// that a configuration file can override them before the first request goes
-/// out. [`Timeouts::default`] is the 5 s connect / 10 s read pair this crate
-/// shipped with.
+/// The HTTP timeouts, in milliseconds. New configuration exposes one value and
+/// sets both fields to it; the separate fields remain internal so legacy
+/// configuration files keep working until their next write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Timeouts {
     pub connect_ms: u64,
@@ -27,7 +24,7 @@ pub struct Timeouts {
 impl Default for Timeouts {
     fn default() -> Self {
         Timeouts {
-            connect_ms: 5_000,
+            connect_ms: 10_000,
             read_ms: 10_000,
         }
     }
@@ -222,12 +219,10 @@ impl fmt::Display for TransportError {
 
 impl std::error::Error for TransportError {}
 
-/// The shared HTTP agent.
-///
-/// The specification fixes no HTTP timeouts; this implementation picks a 5 s
-/// connect timeout and a 10 s read timeout so a dead portal cannot hang the
-/// authentication state machine forever. [`set_timeouts`] replaces both before
-/// the first request; later calls have no effect.
+/// The specification fixes no HTTP timeout; new configuration applies one
+/// value to both connection and response reads. A legacy file may still supply
+/// the old pair until its next write. [`set_timeouts`] replaces these values
+/// before the first request; later calls have no effect.
 pub fn agent() -> &'static ureq::Agent {
     static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
         let timeouts = timeouts();

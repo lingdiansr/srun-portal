@@ -507,38 +507,38 @@ mod tests {
         use imp::{delete_argv, lookup_argv, store_argv};
 
         assert_eq!(
-            lookup_argv("testuser"),
+            lookup_argv("alice@example"),
             vec![
                 "secret-tool",
                 "lookup",
                 "service",
                 "srun-portal",
                 "account",
-                "testuser"
+                "alice@example"
             ]
         );
         assert_eq!(
-            store_argv("testuser"),
+            store_argv("alice@example"),
             vec![
                 "secret-tool",
                 "store",
                 "--label",
-                "srun-portal: testuser",
+                "srun-portal: alice@example",
                 "service",
                 "srun-portal",
                 "account",
-                "testuser",
+                "alice@example",
             ]
         );
         assert_eq!(
-            delete_argv("testuser"),
+            delete_argv("alice@example"),
             vec![
                 "secret-tool",
                 "clear",
                 "service",
                 "srun-portal",
                 "account",
-                "testuser"
+                "alice@example"
             ]
         );
     }

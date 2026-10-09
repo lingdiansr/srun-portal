@@ -12,12 +12,15 @@
 //! issued by this flow: the reference does not request them for the login and
 //! sign-out paths, and issuing extra requests would break request-set equality.
 
+mod args;
+
+use self::args::{Args, Command, ConfigAction, ServiceAction, USAGE};
+use crate::account::AccountIdentity;
 use crate::api;
 use crate::config;
 use crate::credentials;
 use crate::format;
-use crate::keyring;
-use crate::reconnect::{self, domain_arg, fetch_config, host_of};
+use crate::reconnect::{self, fetch_config, host_of};
 use crate::runtime::{Runtime, RuntimeOptions};
 use crate::service;
 use crate::settings;
@@ -25,162 +28,9 @@ use crate::sys;
 use crate::transport;
 use std::path::PathBuf;
 
-/// The options the CLI accepts, before any of them has been acted on.
-#[derive(Debug)]
-struct Args {
-    portal_url: Option<String>,
-    config: Option<PathBuf>,
-    portable: bool,
-    help: bool,
-    command: Option<Command>,
-}
-
-/// The subcommand, when one was given. The interactive flow is what happens
-/// without one.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Command {
-    /// One "check, log in when needed" pass; what the installed task runs.
-    Reconnect,
-    /// Install, remove, or report the background task.
-    Service(ServiceAction),
-    /// Inspect or edit the configuration file.
-    Config(ConfigAction),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ServiceAction {
-    Install,
-    Uninstall,
-    Status,
-    /// Remove the stored password from every store that keeps one.
-    Forget,
-}
-
-/// `srun-portal config …`: the configuration file, read and written through the
-/// same key catalogue the loader uses, so a value typed here is a value that
-/// loads.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ConfigAction {
-    /// Every key with its value: what is set now, after layering.
-    Show,
-    /// Just the keys the file itself sets.
-    List,
-    /// Set one or more `key value` pairs.
-    Set(Vec<(String, String)>),
-    /// Remove the named keys from the file.
-    Unset(Vec<String>),
-}
-
-const USAGE: &str = "Usage: srun-portal [options] [portal-url]\n       srun-portal [options] reconnect\n       srun-portal [options] service install|uninstall|status|forget\n       srun-portal [options] config show|list|set|unset\n\nOptions:\n  --config <path>   use exactly this configuration file (created when missing)\n  --portable        keep the configuration next to the executable\n  --help, -h        print this help and exit\n\nCommands:\n  reconnect              check the connection once and log in when needed\n  service install        install the background reconnect task for this system\n  service uninstall      remove it\n  service status         show what is installed and what the system says\n  service forget         delete the stored password (keyring and file)\n  config show            print every effective setting\n  config list            print the keys the configuration file itself sets\n  config set KEY VALUE   change one setting (repeatable)\n  config unset KEY       remove one setting (repeatable)\n\nEnvironment:\n  SRUN_PORTAL_CONFIG     configuration file path (same as --config)\n  SRUN_PORTAL_PASSWORD   password for `reconnect` (overrides the stored one)\n";
-
-/// Parse `argv` (without the program name). Unknown options and a second
-/// positional argument are usage errors, which the caller reports with
-/// [`USAGE`] and a distinct exit status.
-///
-/// The first positional argument is compared against the command names first:
-/// neither `reconnect` nor `service` can be a portal URL, so the interactive
-/// case is unaffected. Everything after a command belongs to it, and only
-/// `service` takes one more word — its action.
-fn parse_args(argv: &[String]) -> Result<Args, String> {
-    let mut args = Args {
-        portal_url: None,
-        config: None,
-        portable: false,
-        help: false,
-        command: None,
-    };
-    let mut rest = argv.iter();
-    while let Some(arg) = rest.next() {
-        let arg = arg.as_str();
-        if args.command.is_none() && arg == "reconnect" {
-            args.command = Some(Command::Reconnect);
-            continue;
-        }
-        if args.command.is_none() && arg == "service" {
-            let action = rest.next().ok_or_else(|| {
-                "service needs an action: install, uninstall, status or forget".to_string()
-            })?;
-            args.command = Some(Command::Service(match action.as_str() {
-                "install" => ServiceAction::Install,
-                "uninstall" => ServiceAction::Uninstall,
-                "status" => ServiceAction::Status,
-                "forget" => ServiceAction::Forget,
-                other => return Err(format!("Unknown service action: {other}")),
-            }));
-            continue;
-        }
-        if args.command.is_none() && arg == "config" {
-            let action = rest
-                .next()
-                .ok_or_else(|| "config needs an action: show, list, set or unset".to_string())?;
-            let action = match action.as_str() {
-                "show" => ConfigAction::Show,
-                "list" => ConfigAction::List,
-                // `set` and `unset` take the rest of the command line: a key
-                // name is never an option, so nothing here can be mistaken for
-                // one, and `set` needs pairs rather than a fixed arity.
-                "set" => {
-                    let words: Vec<String> = rest.by_ref().cloned().collect();
-                    if words.is_empty() || !words.len().is_multiple_of(2) {
-                        return Err(
-                            "config set needs KEY VALUE pairs, e.g. `config set username testuser`"
-                                .to_string(),
-                        );
-                    }
-                    ConfigAction::Set(
-                        words
-                            .chunks(2)
-                            .map(|pair| (pair[0].clone(), pair[1].clone()))
-                            .collect(),
-                    )
-                }
-                "unset" => {
-                    let keys: Vec<String> = rest.by_ref().cloned().collect();
-                    if keys.is_empty() {
-                        return Err("config unset needs at least one KEY".to_string());
-                    }
-                    ConfigAction::Unset(keys)
-                }
-                other => return Err(format!("Unknown config action: {other}")),
-            };
-            args.command = Some(Command::Config(action));
-            continue;
-        }
-        match arg {
-            "--help" | "-h" => args.help = true,
-            "--portable" => args.portable = true,
-            "--config" => {
-                let value = rest
-                    .next()
-                    .ok_or_else(|| "--config needs a path".to_string())?;
-                args.config = Some(PathBuf::from(value));
-            }
-            _ if arg.starts_with("--config=") => {
-                let value = &arg["--config=".len()..];
-                if value.is_empty() {
-                    return Err("--config needs a path".to_string());
-                }
-                args.config = Some(PathBuf::from(value));
-            }
-            _ if arg.starts_with('-') && arg.len() > 1 => {
-                return Err(format!("Unknown option: {arg}"));
-            }
-            _ => {
-                // After a command there is no positional argument left to take:
-                // the URL is the interactive form's argument only.
-                if args.command.is_some() || args.portal_url.is_some() {
-                    return Err(format!("Unexpected argument: {arg}"));
-                }
-                args.portal_url = Some(arg.to_string());
-            }
-        }
-    }
-    Ok(args)
-}
-
 /// Run the CLI; the returned value is the process exit status.
 pub fn run(argv: Vec<String>) -> i32 {
-    let args = match parse_args(&argv) {
+    let args = match args::parse(&argv) {
         Ok(args) => args,
         Err(message) => {
             eprintln!("{message}");
@@ -189,7 +39,7 @@ pub fn run(argv: Vec<String>) -> i32 {
         }
     };
     if args.help {
-        print!("{USAGE}");
+        print!("{}", args::help_text(&args));
         return 0;
     }
 
@@ -210,6 +60,10 @@ pub fn run(argv: Vec<String>) -> i32 {
         Ok(loaded) => loaded,
         Err(status) => return status,
     };
+    if let Err(status) = apply_setting_options(&mut resolution, &args, true) {
+        return status;
+    }
+
     if let Some(path) = resolution.imported_legacy.as_deref() {
         eprintln!("Imported {}", path.display());
     }
@@ -239,19 +93,18 @@ pub fn run(argv: Vec<String>) -> i32 {
 
     // The configured URL is what the next run reads first, so it is recorded in
     // the file that was read first: the project file, or the system one.
-    if let Some(base) = resolution.base.as_mut() {
-        let slug = format!(
-            "{}{}?ac_id={}",
-            portal.origin,
-            api::CONFIG_PATHNAME,
-            portal.ac_id
-        );
-        if let Err(err) = base.update(&[("portal_url", toml::Value::String(slug))]) {
-            eprintln!("{err}");
-        }
+    let slug = format!(
+        "{}{}?ac_id={}",
+        portal.origin,
+        api::CONFIG_PATHNAME,
+        portal.ac_id
+    );
+    if let Err(err) = resolution.update(&[("portal_url", toml::Value::String(slug))]) {
+        eprintln!("{err}");
     }
 
     let mut options = RuntimeOptions::from_config(&cfg, &portal.origin, &host_of(&portal.origin));
+    // Keep legacy callback settings effective until the next config write.
     options.callback = resolution.effective.callback.clone();
     let mut runtime = Runtime::new(options);
     runtime.apply_interface_correction(&sys::network_interfaces(), &cfg.ip);
@@ -283,33 +136,32 @@ pub fn run(argv: Vec<String>) -> i32 {
 
     // SPEC §5/§12 item 11: a rejected authentication prompts again, forever.
     loop {
-        let label = match resolution.effective.username.as_deref() {
-            Some(username) if !username.is_empty() => {
-                format!("Please enter your username [{username}]: ")
-            }
-            _ => "Please enter your username: ".to_string(),
-        };
-        let entered = match prompt(&label) {
-            Ok(value) => value,
-            Err(status) => return status,
-        };
-        // An empty answer accepts the configured account.
-        let username = if entered.trim().is_empty() {
+        let username = if has_setting_option(&args, "username") {
             resolution.effective.username.clone().unwrap_or_default()
         } else {
-            entered
+            let label = match resolution.effective.username.as_deref() {
+                Some(username) if !username.is_empty() => {
+                    format!("Please enter your username [{username}]: ")
+                }
+                _ => "Please enter your username: ".to_string(),
+            };
+            let entered = match prompt(&label) {
+                Ok(value) => value,
+                Err(status) => return status,
+            };
+            // An empty answer accepts the configured account.
+            if entered.trim().is_empty() {
+                resolution.effective.username.clone().unwrap_or_default()
+            } else {
+                entered
+            }
         };
         let password = match password_prompt() {
             Ok(value) => value,
             Err(status) => return status,
         };
-        let (account, typed_domain) = split_domain(&username);
-        let domain = if typed_domain.is_empty() {
-            domain_arg(resolution.effective.domain.as_deref())
-        } else {
-            typed_domain
-        };
-        match runtime.auth_by_password(&account, &password, &domain) {
+        let identity = AccountIdentity::parse(&username, resolution.effective.domain.as_deref());
+        match runtime.auth_by_password(identity.local(), &password, identity.domain()) {
             Ok(()) => {
                 println!("Auth Success!");
                 show_account_info(&runtime);
@@ -335,7 +187,10 @@ fn run_config(action: &ConfigAction, args: &Args) -> i32 {
     match action {
         ConfigAction::Show => {
             let effective = &resolution.effective;
-            for spec in settings::KEY_CATALOGUE {
+            for spec in settings::KEY_CATALOGUE
+                .iter()
+                .chain(settings::LEGACY_KEY_CATALOGUE.iter())
+            {
                 let value = effective_value(effective, spec.name);
                 println!("{}: {value}", spec.name);
                 println!("    {}", spec.about);
@@ -368,11 +223,7 @@ fn run_config(action: &ConfigAction, args: &Args) -> i32 {
                     }
                 }
             }
-            let Some(base) = resolution.base.as_mut() else {
-                eprintln!("No configuration file to write to");
-                return 1;
-            };
-            match base.update(&changes) {
+            match resolution.update(&changes) {
                 Ok(_) => {
                     for (key, value) in &changes {
                         println!("{key} = {}", render_config_value(value));
@@ -392,11 +243,7 @@ fn run_config(action: &ConfigAction, args: &Args) -> i32 {
                     return 2;
                 }
             }
-            let Some(base) = resolution.base.as_mut() else {
-                eprintln!("No configuration file to write to");
-                return 1;
-            };
-            match base.remove(&keys.iter().map(String::as_str).collect::<Vec<_>>()) {
+            match resolution.remove(&keys.iter().map(String::as_str).collect::<Vec<_>>()) {
                 Ok(changed) => {
                     for key in keys {
                         if changed {
@@ -436,6 +283,16 @@ fn effective_value(effective: &settings::Effective, key: &str) -> String {
         "callback" => effective.callback.clone(),
         "connect_timeout_ms" => effective.timeouts.connect_ms.to_string(),
         "read_timeout_ms" => effective.timeouts.read_ms.to_string(),
+        "timeout_ms" => {
+            if effective.timeouts.connect_ms == effective.timeouts.read_ms {
+                effective.timeouts.connect_ms.to_string()
+            } else {
+                format!(
+                    "{} (legacy connect/read values differ)",
+                    effective.timeouts.read_ms
+                )
+            }
+        }
         "reconnect_interval_secs" => match effective.reconnect_interval_secs {
             Some(secs) => format!("{secs}s"),
             None => "(off: no interval)".to_string(),
@@ -497,29 +354,32 @@ fn load_settings(args: &Args) -> Result<settings::Resolution, i32> {
 /// Nothing here may prompt: this is what the background task runs, and a prompt
 /// with no terminal behind it would hang the timer instead of reporting why.
 fn run_reconnect(args: &Args) -> i32 {
-    let resolution = match load_settings(args) {
+    let mut resolution = match load_settings(args) {
         Ok(loaded) => loaded,
         Err(status) => return status,
     };
+    if let Err(status) = apply_setting_options(&mut resolution, args, false) {
+        return status;
+    }
     let _ = transport::set_timeouts(resolution.effective.timeouts);
 
     let portal = match configured_portal(&resolution.effective) {
         Ok(portal) => portal,
         Err(status) => return status,
     };
-    let username = match configured_username(&resolution.effective) {
-        Ok(username) => username,
+    let account = match configured_account(&resolution.effective) {
+        Ok(account) => account,
         Err(status) => return status,
     };
-    let password = match configured_password(&username, resolution.base_path.as_deref()) {
+    let password = match configured_password(&account, resolution.base_path.as_deref()) {
         Ok(password) => password,
         Err(status) => return status,
     };
 
     let target = reconnect::Target {
         portal,
-        username,
-        domain: reconnect::domain_arg(resolution.effective.domain.as_deref()),
+        username: account.local().to_string(),
+        domain: account.domain().to_string(),
         callback: resolution.effective.callback.clone(),
     };
     match reconnect::reconnect_once(&target, &password) {
@@ -553,10 +413,14 @@ fn configured_portal(effective: &settings::Effective) -> Result<config::PortalUr
     })
 }
 
-/// The configured account name. `Err` is the exit status.
-fn configured_username(effective: &settings::Effective) -> Result<String, i32> {
+/// The configured account's protocol and credential identities. Legacy config
+/// files may still carry `domain`; it is honored until their next write.
+fn configured_account(effective: &settings::Effective) -> Result<AccountIdentity, i32> {
     match effective.username.as_deref() {
-        Some(username) if !username.is_empty() => Ok(username.to_string()),
+        Some(username) if !username.is_empty() => Ok(AccountIdentity::parse(
+            username,
+            effective.domain.as_deref(),
+        )),
         _ => {
             eprintln!("{}", crate::messages::USERNAME_REQUIRED);
             Err(1)
@@ -564,10 +428,13 @@ fn configured_username(effective: &settings::Effective) -> Result<String, i32> {
     }
 }
 
-/// The password to authenticate with: `SRUN_PORTAL_PASSWORD`, then whatever the
-/// system keeps for `account` (the credential facility, then the fallback file).
+/// The password to authenticate with: `SRUN_PORTAL_PASSWORD`, then the stored
+/// password for the complete effective account key.
 /// `Err` is the exit status.
-fn configured_password(account: &str, config: Option<&std::path::Path>) -> Result<String, i32> {
+fn configured_password(
+    account: &AccountIdentity,
+    config: Option<&std::path::Path>,
+) -> Result<String, i32> {
     let path = match config.map(credentials::path_for) {
         Some(path) => path,
         None => {
@@ -575,7 +442,7 @@ fn configured_password(account: &str, config: Option<&std::path::Path>) -> Resul
             return Err(1);
         }
     };
-    let stored = match credentials::read(account, &path) {
+    let stored = match credentials::read(account.qualified(), &path) {
         Ok(stored) => stored,
         Err(err) => {
             eprintln!("{err}");
@@ -592,14 +459,78 @@ fn configured_password(account: &str, config: Option<&std::path::Path>) -> Resul
     }
 }
 
+fn apply_effective_setting(
+    effective: &mut settings::Effective,
+    key: &str,
+    value: &toml::Value,
+) -> Result<(), i32> {
+    match (key, value) {
+        ("portal_url", toml::Value::String(value)) => {
+            effective.portal_url = Some(value.clone());
+        }
+        ("username", toml::Value::String(value)) => {
+            effective.username = Some(value.clone());
+        }
+        ("timeout_ms", toml::Value::Integer(value)) => {
+            effective.timeouts.connect_ms = *value as u64;
+            effective.timeouts.read_ms = *value as u64;
+        }
+        ("reconnect_interval_secs", toml::Value::Integer(value)) => {
+            effective.reconnect_interval_secs = (*value > 0).then_some(*value as u64);
+        }
+        ("reconnect_boot_delay_secs", toml::Value::Integer(value)) => {
+            effective.reconnect_boot_delay_secs = (*value > 0).then_some(*value as u64);
+        }
+        _ => {
+            eprintln!("Internal error: invalid configuration value for {key}");
+            return Err(1);
+        }
+    }
+    Ok(())
+}
+
+/// Apply command-line configuration options to this run, optionally persisting
+/// them in the selected configuration file.
+fn apply_setting_options(
+    resolution: &mut settings::Resolution,
+    args: &Args,
+    persist: bool,
+) -> Result<(), i32> {
+    if args.setting_options.is_empty() {
+        return Ok(());
+    }
+    let mut changes = Vec::with_capacity(args.setting_options.len());
+    for (key, value) in &args.setting_options {
+        let parsed = settings::parse_key_value(key, value).map_err(|err| {
+            eprintln!("--{} {}: {err}", key.replace('_', "-"), value);
+            1
+        })?;
+        changes.push((key.as_str(), parsed));
+    }
+    if persist {
+        if let Err(err) = resolution.update(&changes) {
+            eprintln!("{err}");
+            return Err(1);
+        }
+        return Ok(());
+    }
+    for (key, value) in &changes {
+        apply_effective_setting(&mut resolution.effective, key, value)?;
+    }
+    Ok(())
+}
+
 /// `srun-portal service install|uninstall|status`.
 fn run_service(action: ServiceAction, args: &Args) -> i32 {
     let mut resolution = match load_settings(args) {
         Ok(loaded) => loaded,
         Err(status) => return status,
     };
-    let _ = transport::set_timeouts(resolution.effective.timeouts);
-
+    if action == ServiceAction::Install {
+        if let Err(status) = apply_setting_options(&mut resolution, args, true) {
+            return status;
+        }
+    }
     let config = match resolution.base_path.clone() {
         Some(path) => path,
         None => {
@@ -621,7 +552,7 @@ fn run_service(action: ServiceAction, args: &Args) -> i32 {
             return 1;
         }
     };
-    let spec = service::Spec {
+    let mut spec = service::Spec {
         exe,
         config: config.clone(),
         interval_secs: resolution.effective.reconnect_interval_secs,
@@ -632,10 +563,13 @@ fn run_service(action: ServiceAction, args: &Args) -> i32 {
         ServiceAction::Install => {
             // A task needs a portal and an account: filling them in now is the
             // last moment a question can still be answered.
-            if let Err(status) = ensure_unattended_settings(&mut resolution) {
+            if let Err(status) = ensure_service_install_settings(&mut resolution, args) {
                 return status;
             }
-            let account = match configured_username(&resolution.effective) {
+            let _ = transport::set_timeouts(resolution.effective.timeouts);
+            spec.interval_secs = resolution.effective.reconnect_interval_secs;
+            spec.boot_delay_secs = resolution.effective.reconnect_boot_delay_secs;
+            let account = match configured_account(&resolution.effective) {
                 Ok(account) => account,
                 Err(status) => return status,
             };
@@ -650,8 +584,8 @@ fn run_service(action: ServiceAction, args: &Args) -> i32 {
                     Ok(portal) => portal,
                     Err(status) => return status,
                 },
-                username: account.clone(),
-                domain: reconnect::domain_arg(resolution.effective.domain.as_deref()),
+                username: account.local().to_string(),
+                domain: account.domain().to_string(),
                 callback: resolution.effective.callback.clone(),
             };
             match reconnect::reconnect_once(&target, &password) {
@@ -665,7 +599,7 @@ fn run_service(action: ServiceAction, args: &Args) -> i32 {
             }
 
             let credentials_path = credentials::path_for(&config);
-            match credentials::store(&target.username, &password, &credentials_path) {
+            match credentials::store(account.qualified(), &password, &credentials_path) {
                 Ok((store, note)) => {
                     if let Some(note) = note {
                         println!("{note}");
@@ -673,7 +607,7 @@ fn run_service(action: ServiceAction, args: &Args) -> i32 {
                     println!(
                         "Password: stored in the {} ({})",
                         store.name(),
-                        target.username
+                        account.qualified()
                     );
                     if store == credentials::Store::File {
                         println!("Chmod 600 {}", credentials_path.display());
@@ -730,14 +664,15 @@ fn run_service(action: ServiceAction, args: &Args) -> i32 {
                     credentials_path.display()
                 );
             }
-            if let Ok(account) = configured_username(&resolution.effective) {
-                if credentials::read(&account, &credentials_path)
+            if let Ok(account) = configured_account(&resolution.effective) {
+                if credentials::read(account.qualified(), &credentials_path)
                     .ok()
                     .flatten()
                     .is_some()
                 {
                     println!(
-                        "Kept the stored password for {account} (run `srun-portal service forget`)"
+                        "Kept the stored password for {} (run `srun-portal service forget`)",
+                        account.qualified()
                     );
                 }
             }
@@ -762,7 +697,7 @@ fn run_service(action: ServiceAction, args: &Args) -> i32 {
         }
         ServiceAction::Forget => {
             let credentials_path = credentials::path_for(&config);
-            let account = match configured_username(&resolution.effective) {
+            let account = match configured_account(&resolution.effective) {
                 Ok(account) => account,
                 // Without an account there is no entry to name; the file is
                 // still worth reporting about, so fall through to the keyring
@@ -787,13 +722,13 @@ fn run_service(action: ServiceAction, args: &Args) -> i32 {
                     return 0;
                 }
             };
-            match credentials::revoke(&account, &credentials_path) {
+            match credentials::revoke(account.qualified(), &credentials_path) {
                 Ok(true) => {
-                    println!("Removed the stored password for {account}");
+                    println!("Removed the stored password for {}", account.qualified());
                     0
                 }
                 Ok(false) => {
-                    println!("No stored password for {account}");
+                    println!("No stored password for {}", account.qualified());
                     0
                 }
                 Err(err) => {
@@ -813,22 +748,36 @@ fn credentials_status(resolution: &settings::Resolution, config: &std::path::Pat
             credentials::ENV_PASSWORD
         );
     }
-    let account = match configured_username(&resolution.effective) {
+    let account = match configured_account(&resolution.effective) {
         Ok(account) => account,
         Err(_) => return "no account configured".to_string(),
     };
     let path = credentials::path_for(config);
-    if keyring::read(&account).ok().flatten().is_some() {
-        return format!("stored in the system keyring ({account})");
+    let status = credentials::status(account.qualified(), &path);
+    render_credentials_status(account.qualified(), &path, status)
+}
+
+fn render_credentials_status(
+    account_key: &str,
+    path: &std::path::Path,
+    status: credentials::Status,
+) -> String {
+    match status {
+        credentials::Status::Keyring => {
+            format!("stored in the system keyring ({account_key})")
+        }
+        credentials::Status::File => {
+            format!("stored in {} ({account_key})", path.display())
+        }
+        credentials::Status::Missing {
+            keyring_unavailable,
+        } => {
+            let reason = keyring_unavailable
+                .map(|reason| format!(" - keyring unavailable: {reason}"))
+                .unwrap_or_default();
+            format!("none stored for {account_key}{reason}")
+        }
     }
-    if credentials::read_file(&path).ok().flatten().is_some() {
-        return format!("stored in {} ({account})", path.display());
-    }
-    let reason = match keyring::availability() {
-        keyring::Availability::Ready => String::new(),
-        keyring::Availability::Unavailable(reason) => format!(" - keyring unavailable: {reason}"),
-    };
-    format!("none stored for {account}{reason}")
 }
 
 /// Fill in `portal_url` and `username` when the task could not work without
@@ -884,43 +833,160 @@ fn ensure_unattended_settings(resolution: &mut settings::Resolution) -> Result<(
     Ok(())
 }
 
-/// Write one key into the configuration file the run is anchored on, and into
-/// the effective settings the same run keeps using.
+fn has_setting_option(args: &Args, key: &str) -> bool {
+    args.setting_options
+        .iter()
+        .any(|(option_key, _)| option_key == key)
+}
+
+fn prompt_with_default(label: &str, default: Option<&str>) -> Result<String, i32> {
+    let prompt_label = match default {
+        Some(value) if !value.is_empty() => format!("{label} [{value}]: "),
+        _ => format!("{label}: "),
+    };
+    let input = prompt(&prompt_label)?;
+    if input.trim().is_empty() {
+        Ok(default.unwrap_or_default().to_string())
+    } else {
+        Ok(input)
+    }
+}
+
+fn prompt_u64_setting(
+    resolution: &mut settings::Resolution,
+    args: &Args,
+    key: &str,
+    label: &str,
+    default: u64,
+) -> Result<(), i32> {
+    if has_setting_option(args, key) {
+        return Ok(());
+    }
+    loop {
+        let input = prompt_with_default(label, Some(&default.to_string()))?;
+        match input.trim().parse::<u64>() {
+            Ok(value) if value <= i64::MAX as u64 => {
+                return record_setting_value(resolution, key, toml::Value::Integer(value as i64));
+            }
+            _ => eprintln!("{label} must be a non-negative integer"),
+        }
+    }
+}
+
+/// Interactive `service install` configuration. Existing values are shown as
+/// defaults; an empty answer keeps them. Non-interactive callers retain the
+/// strict two-required-values behavior.
+fn ensure_service_install_settings(
+    resolution: &mut settings::Resolution,
+    args: &Args,
+) -> Result<(), i32> {
+    if !sys::stdin_is_tty() {
+        return ensure_unattended_settings(resolution);
+    }
+
+    if !has_setting_option(args, "portal_url") {
+        let default = resolution
+            .effective
+            .portal_url
+            .clone()
+            .filter(|value| config::parse_portal_url(value).is_ok());
+        loop {
+            let input = prompt_with_default("Portal web url", default.as_deref())?;
+            if input.trim().is_empty() {
+                eprintln!("{}", crate::messages::PORTAL_URL_REQUIRED);
+                continue;
+            }
+            match config::parse_portal_url(&input) {
+                Ok(_) => {
+                    record_setting(resolution, "portal_url", &input)?;
+                    break;
+                }
+                Err(err) => eprintln!("{err}"),
+            }
+        }
+    }
+
+    if !has_setting_option(args, "username") {
+        let default = resolution
+            .effective
+            .username
+            .clone()
+            .filter(|value| !value.is_empty());
+        loop {
+            let input = prompt_with_default("Username", default.as_deref())?;
+            if input.trim().is_empty() {
+                eprintln!("{}", crate::messages::USERNAME_REQUIRED);
+                continue;
+            }
+            record_setting(resolution, "username", &input)?;
+            break;
+        }
+    }
+
+    prompt_u64_setting(
+        resolution,
+        args,
+        "timeout_ms",
+        "Timeout (ms)",
+        resolution
+            .effective
+            .timeouts
+            .connect_ms
+            .max(resolution.effective.timeouts.read_ms),
+    )?;
+    prompt_u64_setting(
+        resolution,
+        args,
+        "reconnect_interval_secs",
+        "Reconnect interval (seconds)",
+        resolution.effective.reconnect_interval_secs.unwrap_or(0),
+    )?;
+    prompt_u64_setting(
+        resolution,
+        args,
+        "reconnect_boot_delay_secs",
+        "Reconnect startup delay (seconds)",
+        resolution.effective.reconnect_boot_delay_secs.unwrap_or(0),
+    )?;
+    Ok(())
+}
+
+/// Write one key into the configuration file the run is anchored on; Resolution
+/// refreshes the effective settings from all layers.
 fn record_setting(
     resolution: &mut settings::Resolution,
     key: &str,
     value: &str,
 ) -> Result<(), i32> {
-    let Some(base) = resolution.base.as_mut() else {
-        eprintln!("No configuration file to record {key} in");
-        return Err(1);
-    };
-    if let Err(err) = base.update(&[(key, toml::Value::String(value.to_string()))]) {
+    record_setting_value(resolution, key, toml::Value::String(value.to_string()))
+}
+
+fn record_setting_value(
+    resolution: &mut settings::Resolution,
+    key: &str,
+    value: toml::Value,
+) -> Result<(), i32> {
+    if let Err(err) = resolution.update(&[(key, value)]) {
         eprintln!("{err}");
         return Err(1);
-    }
-    match key {
-        "portal_url" => resolution.effective.portal_url = Some(value.to_string()),
-        "username" => resolution.effective.username = Some(value.to_string()),
-        other => {
-            eprintln!("Internal error: {other} is not a promptable key");
-            return Err(1);
-        }
     }
     Ok(())
 }
 
 /// The password to store for the task, in order of precedence: the environment
-/// (`SRUN_PORTAL_PASSWORD`), the one already stored for this account, then a
-/// prompt.
+/// (`SRUN_PORTAL_PASSWORD`), the password already stored for this complete
+/// account key, then a prompt.
 ///
 /// Reusing the stored password matters because `install` is rerun whenever the
 /// units change: asking again — or worse, failing because nobody can type one —
 /// would make a reinstall impossible on a machine that already has a working
 /// credential. An empty answer at the prompt also accepts the stored one.
-fn install_password(account: &str, config: Option<&std::path::Path>) -> Result<String, i32> {
+fn install_password(
+    account: &AccountIdentity,
+    config: Option<&std::path::Path>,
+) -> Result<String, i32> {
     let stored = match config.map(credentials::path_for) {
-        Some(path) => match credentials::read(account, &path) {
+        Some(path) => match credentials::read(account.qualified(), &path) {
             Ok(stored) => stored,
             Err(err) => {
                 eprintln!("{err}");
@@ -972,6 +1038,17 @@ fn install_password(account: &str, config: Option<&std::path::Path>) -> Result<S
 /// prompt (SPEC §3.1, with a configuration file in place of the legacy env
 /// file).
 fn resolve_slug(args: &Args, resolution: &settings::Resolution) -> Result<String, i32> {
+    if has_setting_option(args, "portal_url") {
+        if let Some(slug) = resolution.effective.portal_url.as_deref() {
+            return config::parse_portal_url(slug)
+                .map(|_| slug.to_string())
+                .map_err(|err| {
+                    eprintln!("{err}");
+                    1
+                });
+        }
+    }
+
     if let Some(argument) = args.portal_url.as_deref() {
         return match config::parse_portal_url(argument) {
             Ok(_) => Ok(argument.to_string()),
@@ -1046,18 +1123,6 @@ fn confirm(label: &str) -> Result<bool, String> {
     }
 }
 
-/// `user@domain` typed as one field: everything after the first `@` becomes the
-/// domain argument again, with its `@`, which is the shape `authByPassword`
-/// requires (SPEC §5, §10's `Domain must start with @`).
-pub fn split_domain(username: &str) -> (String, String) {
-    match username.split_once('@') {
-        Some((account, domain)) if !domain.is_empty() => {
-            (account.to_string(), format!("@{domain}"))
-        }
-        _ => (username.to_string(), String::new()),
-    }
-}
-
 /// The reference's account panel: a 25 character rule, a centred
 /// `You're online`, the fields, and a closing rule.
 fn show_account_info(runtime: &Runtime) {
@@ -1103,219 +1168,72 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_args_reads_options_and_one_url() {
-        let args = parse_args(&[]).unwrap();
-        assert_eq!(args.portal_url, None);
-        assert!(!args.portable);
-        assert!(!args.help);
-
-        let args = parse_args(&[
-            "--portable".to_string(),
-            "https://h/srun_portal_pc?ac_id=1".to_string(),
-        ])
+    fn service_install_options_are_persisted_and_applied() {
+        let root = std::env::temp_dir().join(format!(
+            "srun-portal-cli-options-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = root.join("config.toml");
+        let paths = settings::Paths {
+            system: root.join("system.toml"),
+            portable: root.join("portable.toml"),
+            legacy: None,
+        };
+        let mut resolution = settings::resolve(&paths, Some(&path), None, &mut |_| {
+            settings::Storage::System
+        })
         .unwrap();
-        assert!(args.portable);
-        assert_eq!(
-            args.portal_url.as_deref(),
-            Some("https://h/srun_portal_pc?ac_id=1")
-        );
-
-        // Both spellings of `--config`, and `--help`.
-        let args = parse_args(&["--config".to_string(), "/tmp/a.toml".to_string()]).unwrap();
-        assert_eq!(args.config, Some(PathBuf::from("/tmp/a.toml")));
-        let args = parse_args(&["--config=/tmp/b.toml".to_string()]).unwrap();
-        assert_eq!(args.config, Some(PathBuf::from("/tmp/b.toml")));
-        assert!(parse_args(&["-h".to_string()]).unwrap().help);
-
-        // Usage errors: a missing or empty `--config` value, an unknown option,
-        // and a second positional argument.
-        assert_eq!(
-            parse_args(&["--config".to_string()]).unwrap_err(),
-            "--config needs a path"
-        );
-        assert_eq!(
-            parse_args(&["--config=".to_string()]).unwrap_err(),
-            "--config needs a path"
-        );
-        assert_eq!(
-            parse_args(&["--nope".to_string()]).unwrap_err(),
-            "Unknown option: --nope"
-        );
-        assert_eq!(
-            parse_args(&[
-                "https://a.example/srun_portal_pc?ac_id=1".to_string(),
-                "extra".to_string()
-            ])
-            .unwrap_err(),
-            "Unexpected argument: extra"
-        );
-    }
-
-    #[test]
-    fn parse_args_reads_the_config_command() {
-        assert_eq!(
-            parse_args(&["config".to_string(), "show".to_string()])
-                .unwrap()
-                .command,
-            Some(Command::Config(ConfigAction::Show))
-        );
-        assert_eq!(
-            parse_args(&["config".to_string(), "list".to_string()])
-                .unwrap()
-                .command,
-            Some(Command::Config(ConfigAction::List))
-        );
-        // `set` takes pairs, so several settings go in one call.
-        assert_eq!(
-            parse_args(&[
-                "config".to_string(),
-                "set".to_string(),
-                "username".to_string(),
-                "testuser".to_string(),
-                "domain".to_string(),
-                "szu".to_string(),
-            ])
-            .unwrap()
-            .command,
-            Some(Command::Config(ConfigAction::Set(vec![
-                ("username".to_string(), "testuser".to_string()),
-                ("domain".to_string(), "szu".to_string()),
-            ])))
-        );
-        assert_eq!(
-            parse_args(&[
-                "config".to_string(),
-                "unset".to_string(),
-                "domain".to_string(),
-                "callback".to_string(),
-            ])
-            .unwrap()
-            .command,
-            Some(Command::Config(ConfigAction::Unset(vec![
-                "domain".to_string(),
-                "callback".to_string(),
-            ])))
-        );
-
-        // Malformed forms are usage errors, not silently partial commands.
-        assert_eq!(
-            parse_args(&["config".to_string()]).unwrap_err(),
-            "config needs an action: show, list, set or unset"
-        );
-        assert_eq!(
-            parse_args(&["config".to_string(), "frobnicate".to_string()]).unwrap_err(),
-            "Unknown config action: frobnicate"
-        );
-        assert_eq!(
-            parse_args(&[
-                "config".to_string(),
-                "set".to_string(),
-                "username".to_string()
-            ])
-            .unwrap_err(),
-            "config set needs KEY VALUE pairs, e.g. `config set username testuser`"
-        );
-        assert_eq!(
-            parse_args(&["config".to_string(), "unset".to_string()]).unwrap_err(),
-            "config unset needs at least one KEY"
-        );
-        // Options may still precede the command.
-        assert!(parse_args(&[
-            "--config".to_string(),
-            "/tmp/a.toml".to_string(),
-            "config".to_string(),
-            "show".to_string(),
-        ])
-        .unwrap()
-        .config
-        .is_some());
-    }
-
-    #[test]
-    fn parse_args_reads_the_commands() {
-        // The words cannot be portal URLs, so they are commands, not slugs.
-        let args = parse_args(&["reconnect".to_string()]).unwrap();
-        assert_eq!(args.command, Some(Command::Reconnect));
-        assert_eq!(args.portal_url, None);
-
-        let args = parse_args(&["service".to_string(), "install".to_string()]).unwrap();
-        assert_eq!(args.command, Some(Command::Service(ServiceAction::Install)));
-        let args = parse_args(&["service".to_string(), "status".to_string()]).unwrap();
-        assert_eq!(args.command, Some(Command::Service(ServiceAction::Status)));
-
-        // Options may come before or after the command.
-        let args = parse_args(&[
-            "--config".to_string(),
-            "/tmp/a.toml".to_string(),
+        let args = args::parse(&[
             "service".to_string(),
-            "uninstall".to_string(),
+            "install".to_string(),
+            "--timeout-ms".to_string(),
+            "12000".to_string(),
+            "--reconnect-interval-secs".to_string(),
+            "0".to_string(),
+            "--reconnect-boot-delay-secs=45".to_string(),
         ])
         .unwrap();
-        assert_eq!(
-            args.command,
-            Some(Command::Service(ServiceAction::Uninstall))
-        );
-        assert_eq!(args.config, Some(PathBuf::from("/tmp/a.toml")));
-        assert!(
-            parse_args(&["reconnect".to_string(), "--portable".to_string()])
-                .unwrap()
-                .portable
-        );
 
-        assert_eq!(
-            parse_args(&["service".to_string()]).unwrap_err(),
-            "service needs an action: install, uninstall, status or forget"
-        );
-        assert_eq!(
-            parse_args(&["service".to_string(), "forget".to_string()])
-                .unwrap()
-                .command,
-            Some(Command::Service(ServiceAction::Forget))
-        );
-        assert_eq!(
-            parse_args(&["service".to_string(), "frobnicate".to_string()]).unwrap_err(),
-            "Unknown service action: frobnicate"
-        );
-        // A command takes no positional argument and takes no second one.
-        assert_eq!(
-            parse_args(&["reconnect".to_string(), "x".to_string()]).unwrap_err(),
-            "Unexpected argument: x"
-        );
-        assert_eq!(
-            parse_args(&[
-                "service".to_string(),
-                "status".to_string(),
-                "extra".to_string()
-            ])
-            .unwrap_err(),
-            "Unexpected argument: extra"
-        );
+        apply_setting_options(&mut resolution, &args, true).unwrap();
+
+        assert_eq!(resolution.effective.reconnect_interval_secs, None);
+        assert_eq!(resolution.effective.reconnect_boot_delay_secs, Some(45));
+        assert_eq!(resolution.effective.timeouts.connect_ms, 12000);
+        assert_eq!(resolution.effective.timeouts.read_ms, 12000);
+        let file = settings::ConfigFile::read(&path).unwrap().unwrap();
+        assert_eq!(file.settings.reconnect_interval_secs, Some(0));
+        assert_eq!(file.settings.reconnect_boot_delay_secs, Some(45));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn a_url_is_still_a_url() {
-        let args = parse_args(&["https://h/srun_portal_pc?ac_id=1".to_string()]).unwrap();
-        assert_eq!(args.command, None);
-        assert_eq!(
-            args.portal_url.as_deref(),
-            Some("https://h/srun_portal_pc?ac_id=1")
-        );
-    }
-
-    #[test]
-    fn split_domain_accepts_an_embedded_domain() {
-        assert_eq!(
-            split_domain("testuser"),
-            ("testuser".to_string(), String::new())
-        );
-        assert_eq!(
-            split_domain("testuser@szu"),
-            ("testuser".to_string(), "@szu".to_string())
-        );
-        assert_eq!(
-            split_domain("testuser@"),
-            ("testuser@".to_string(), String::new())
-        );
+    fn credential_status_renders_the_complete_account_key() {
+        let path = std::path::Path::new("/tmp/srun-portal.credentials.toml");
+        let cases = [
+            (
+                credentials::Status::Keyring,
+                "stored in the system keyring (alice@staff)".to_string(),
+            ),
+            (
+                credentials::Status::File,
+                format!("stored in {} (alice@staff)", path.display()),
+            ),
+            (
+                credentials::Status::Missing {
+                    keyring_unavailable: Some("no wallet".to_string()),
+                },
+                "none stored for alice@staff - keyring unavailable: no wallet".to_string(),
+            ),
+        ];
+        for (status, expected) in cases {
+            let rendered = render_credentials_status("alice@staff", path, status);
+            assert_eq!(rendered, expected);
+            assert!(!rendered.contains("(alice)"));
+        }
     }
 
     #[test]

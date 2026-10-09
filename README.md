@@ -43,7 +43,7 @@ srun-portal [options] config show|list|set|unset
 | `config show` | 显示合并后的有效配置 |
 | `config list` | 显示当前文件实际设置的键 |
 | `config set KEY VALUE` | 设置一个或多个配置项 |
-| `config unset KEY` | 删除配置项，恢复默认值 |
+| `config unset KEY` | 删除配置项，显露较低优先级文件的值或默认值 |
 
 选项：
 
@@ -53,7 +53,7 @@ srun-portal [options] config show|list|set|unset
 
 ## 配置与后台任务
 
-配置文件、配置优先级、所有键的含义、后台调度器和凭据存储方式见
+配置文件、配置优先级、旧键迁移算法、所有键的含义、后台调度器和凭据存储方式见
 [配置与后台运行](docs/configuration.md)。发布、升级、卸载和安全注意事项见
 [发布与运维](RELEASE.md)。
 
@@ -61,15 +61,14 @@ srun-portal [options] config show|list|set|unset
 
 ```toml
 portal_url = "https://net.szu.edu.cn/srun_portal_pc?ac_id=1"
-username = "testuser"
-# domain = "@example"
-# callback = "jsonp"
-# connect_timeout_ms = 5000
-# read_timeout_ms = 10000
+username = "testuser@example"
+timeout_ms = 10000
 ```
 
-后台任务始终以当前用户身份运行。密码优先保存到操作系统凭据设施；没有可用
-凭据设施时，才回退到配置目录旁、权限为 `0600` 的凭据文件。
+后台任务始终以当前用户身份运行。密码优先保存到操作系统凭据设施，并以包含
+`@domain` 的完整有效登录身份隔离；没有可用凭据设施时，才回退到配置目录旁、
+权限为 `0600` 的凭据文件。受旧版裸用户名凭据键缺陷影响的升级用户需要重新运行
+`service install`；新版本不会把裸键密码作为域名账号的回退。
 
 ## 代码结构
 

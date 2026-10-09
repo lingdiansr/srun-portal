@@ -22,7 +22,17 @@
 
 Portal URL 的解析优先级是：命令行位置参数、配置文件中的 `portal_url`、交互式
 输入。`config set` / `config unset` 和交互式流程会写入本次解析所使用的文件。
-未知 TOML 键会在重写时保留。
+未知 TOML 键会在重写时保留。写配置时，目标文件中的旧键按以下规则迁移：
+
+- 目标文件只要含 `connect_timeout_ms` 或 `read_timeout_ms` 且不含当前
+  `timeout_ms`，就把**写入前有效** connect/read 超时（包括默认值和较低优先级
+  文件）的较大值写为 `timeout_ms`，因此迁移不会缩短任一有效旧超时；随后删除
+  两个旧超时键。显式 `config set timeout_ms` 最后覆盖迁移值；显式
+  `config unset timeout_ms` 最后删除它并显露较低层或默认值，不会被迁移重新创建。
+- 非空旧 `domain` 会在有效 `username` 存在时折叠为完整 `user@domain` 后删除；
+  没有有效账号时保留并延后迁移。空 `domain` 直接删除。
+- 目标文件的 `callback` 直接删除，没有替代键；较低优先级文件中的旧
+  `callback` 仍按正常分层生效，直到该文件自身被写入。
 
 ## 配置键
 
@@ -31,11 +41,8 @@ Portal URL 的解析优先级是：命令行位置参数、配置文件中的 `p
 ```toml
 # srun-portal configuration.
 portal_url = "https://net.szu.edu.cn/srun_portal_pc?ac_id=1"
-username = "testuser"
-domain = "@example"
-callback = "jsonp"
-connect_timeout_ms = 5000
-read_timeout_ms = 10000
+username = "testuser@example"
+timeout_ms = 10000
 reconnect_interval_secs = 300
 reconnect_boot_delay_secs = 30
 ```
@@ -43,35 +50,35 @@ reconnect_boot_delay_secs = 30
 | 键 | 含义 |
 |---|---|
 | `portal_url` | 完整 Portal URL，必须包含 `/srun_portal...` 路径和 `ac_id` 查询键 |
-| `username` | 交互式登录和无交互重连接使用的默认账号 |
-| `domain` | 账号没有 `@` 时追加的域名后缀；空值表示不追加 |
-| `callback` | JSONP 回调名，默认 `jsonp` |
-| `connect_timeout_ms` | HTTP 连接超时，默认 5000 ms |
-| `read_timeout_ms` | HTTP 读取超时，默认 10000 ms |
+| `username` | 交互式登录和无交互重连接使用的默认账号；域名直接写成 `user@domain` |
+| `timeout_ms` | HTTP 连接和读取共用的超时，默认 10000 ms |
 | `reconnect_interval_secs` | 后台周期检查间隔；`0` 关闭周期任务 |
 | `reconnect_boot_delay_secs` | 启动后的首次检查延迟；`0` 关闭启动任务 |
 
-有效默认值为 5 秒连接超时、10 秒读取超时、300 秒周期重连接和 30 秒启动延迟。
-首次创建的文件会显式写入默认配置，其中后台任务键写为 `0`，避免首次配置
-完成前自动运行；需要后台任务时通过 `config set` 打开。
+有效默认值为 10 秒 HTTP 超时、300 秒周期重连接和 30 秒启动延迟。
+首次创建的文件会显式写入这些默认值；需要关闭某个后台触发器时将对应键设为
+`0`，需要后台任务时无需额外初始化。
 
-`domain` 的默认值是空字符串。Portal 页面中的 `#domain` 是域名菜单，不会自动
-成为账号后缀。交互式输入支持 `user@domain`，第一个 `@` 后的内容作为域名参数。
+交互式输入和配置中的 `username` 都支持 `user@domain`；第一个 `@` 后的内容作为
+登录域名。协议发送仍使用 local username 与 `@domain` 两个字段，而凭据以完整有效
+身份 `user@domain` 为键。新配置固定使用协议默认 JSONP 回调 `jsonp`；旧版
+`callback` 键在其所在文件下一次写配置前仍然生效。
 
 ## 配置命令
 
 ```text
 srun-portal config show
 srun-portal config list
-srun-portal config set username testuser
-srun-portal config set domain szu reconnect_interval_secs 300
-srun-portal config unset domain
+srun-portal config set username testuser@szu timeout_ms 10000
+srun-portal config set reconnect_interval_secs 300
+srun-portal config unset timeout_ms
 ```
 
-- `show` 显示合并系统配置、便携配置和默认值后的有效结果。
-- `list` 只显示当前文件实际保存的键。
-- `set` 在写入前校验键名和值类型；错误不会破坏文件。
-- `unset` 删除指定键，随后回到默认值或较低优先级文件的值。
+- `show` 显示合并系统配置、便携配置和默认值后的有效结果；旧版键会标为兼容项。
+- `list` 只显示当前文件实际保存的键，包括尚未迁移的旧版键。
+- `set` 在写入前校验整批键名和值类型；任一错误都不会写文件。
+- `unset` 删除指定键，随后立即回到较低优先级文件的值或默认值。旧版键迁移先于
+  显式删除，因此 `config unset timeout_ms` 不会重新生成该键。
 - 这些命令不会读取、写入或删除密码；密码由 `service forget` 管理。
 
 ## 无交互重连接
@@ -88,6 +95,10 @@ srun-portal reconnect
 4. 打印 `Online.`、`Reconnected.` 或可记录到日志的错误信息后退出。
 
 该命令不会提示输入，因此适合交给系统调度器重复执行。
+`reconnect` 支持 `--portal-url`、`--username` 和 `--timeout-ms` 作为本次运行的覆盖值，
+但仍然不会提示输入，也不会把这些覆盖值写回配置文件。重连接周期和启动延迟只对
+`service install` 生效。
+
 
 ## 平台后台任务
 
@@ -97,6 +108,23 @@ srun-portal service status
 srun-portal service uninstall
 srun-portal service forget
 ```
+`service install` 也接受以下 kebab-case 选项；选项值会写入本次使用的配置
+文件，供后续的 timer 读取：
+
+```text
+srun-portal service install \
+  --username testuser@szu \
+  --timeout-ms 10000 \
+  --reconnect-interval-secs 300 \
+  --reconnect-boot-delay-secs 30
+```
+
+可用选项为 `--portal-url`、`--username`、`--timeout-ms`、
+`--reconnect-interval-secs` 和 `--reconnect-boot-delay-secs`。配置文件中的对应键仍
+使用下划线名称，例如 `reconnect_interval_secs`。
+
+交互式执行 `service install` 时，Portal URL、账号、共用超时和两个重连时序都会显示
+当前值作为默认值；直接按 Enter 保留默认值。无终端时不会提示，任务使用配置文件中的值。
 
 任务始终属于当前用户：
 
@@ -136,8 +164,13 @@ Linux 的周期 timer 使用 `OnActiveSec=1s` 解决只有 `OnUnitActiveSec=` �
 | Windows | Credential Manager | `CredReadW` / `CredWriteW` / `CredDeleteW` |
 | macOS | 登录钥匙串 | `security(1)` |
 
-条目使用 `service=srun-portal` 和 `account=<username>` 标识。配置文件不保存
-密码。没有可用凭据设施时，回退文件权限为 `0600`，并会明确报告回退原因。
+条目使用 `service=srun-portal` 和 `account=<完整有效登录身份>` 标识；例如
+`alice@staff` 与 `alice@student` 是严格隔离的两个凭据键。配置文件不保存密码。
+没有可用凭据设施时，回退文件权限为 `0600`，并会明确报告回退原因。
+
+受旧版本裸用户名凭据键缺陷影响的升级用户必须重新运行 `service install` 保存
+当前完整身份的密码。新版本不会为域名账号回退读取或删除可能属于另一域的裸
+`alice` 键，也不会把该密码自动发送到当前 Portal。
 
 `service install` 会先用密码执行 dry run，成功后才保存密码。`service uninstall`
 不会删除密码；需要删除时执行 `service forget`。

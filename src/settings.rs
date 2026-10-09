@@ -8,11 +8,11 @@
 //! * the **project** file, next to the executable — the portable deployment.
 //!
 //! The project file is the project-level configuration: when it is present it
-//! overrides the system file key by key, so a deployment can pin a `callback`
-//! or a timeout without copying the rest of the user's settings. Both are
-//! optional; when neither exists the CLI asks where to put one (portable when
-//! there is no terminal to ask; see [`ask_storage`]) and seeds the new file from
-//! the legacy `~/.srun_portal.json` if that file is still around.
+//! overrides the system file key by key without copying the rest of the user's
+//! settings. Both are optional; when neither exists the CLI asks where to put
+//! one (portable when there is no terminal to ask; see [`ask_storage`]) and
+//! seeds the new file from the legacy `~/.srun_portal.json` if that file is
+//! still around.
 //!
 //! The legacy file is only ever read ([`crate::config::read_legacy`]): it is not
 //! written any more, which is the deliberate deviation from SPEC §3.1/§12 item
@@ -21,13 +21,15 @@
 //! unattended one lives in the system credential facility (see
 //! [`crate::keyring`] and [`crate::credentials`]), never in these files.
 //!
-//! Unknown keys are kept in the parsed table and written back unchanged, so a
-//! future key survives an older binary rewriting the file.
+//! Unknown keys are kept in the parsed table and written back unchanged, except
+//! for the four legacy login/timeout keys, which are migrated away on the next
+//! configuration write.
 
 use std::path::{Path, PathBuf};
 
 use toml::Value;
 
+use crate::account::AccountIdentity;
 use crate::config::{self, ConfigError};
 use crate::sys;
 use crate::transport::Timeouts;
@@ -45,18 +47,36 @@ const HEADER: &str = "\
 # Every key is optional; unknown keys are preserved across rewrites.
 #   portal_url          full portal URL, e.g. \"https://net.szu.edu.cn/srun_portal_pc?ac_id=1\"
 #   username            account name used as the default for the login prompt
-#   domain              domain suffix used when the account carries none (with or
-#                       without '@'; empty or unset means no suffix, which is what
-#                       the portal's own capture does)
-#   callback            JSONP callback name (default \"jsonp\")
-#   connect_timeout_ms  HTTP connect timeout in milliseconds (default 5000)
-#   read_timeout_ms     HTTP read timeout in milliseconds (default 10000)
+#   timeout_ms          HTTP connection and read timeout in milliseconds (default 10000)
 #   reconnect_interval_secs   background reconnect interval in seconds (default 300; 0: no interval)
 #   reconnect_boot_delay_secs delay after startup before the first check (default 30; 0: not at startup)
 ";
+fn migrate_legacy_keys(raw: &mut toml::Table, snapshot: &Effective) {
+    let has_legacy_timeout =
+        raw.contains_key("connect_timeout_ms") || raw.contains_key("read_timeout_ms");
+    if has_legacy_timeout && !raw.contains_key("timeout_ms") {
+        let timeout_ms = snapshot.timeouts.connect_ms.max(snapshot.timeouts.read_ms);
+        raw.insert("timeout_ms".to_string(), Value::Integer(timeout_ms as i64));
+    }
+    raw.remove("connect_timeout_ms");
+    raw.remove("read_timeout_ms");
 
-const DEFAULT_CONNECT_MS: u64 = 5_000;
-const DEFAULT_READ_MS: u64 = 10_000;
+    if let Some(domain) = raw.get("domain").and_then(Value::as_str) {
+        if domain.is_empty() {
+            raw.remove("domain");
+        } else if let Some(username) = snapshot.username.as_deref().filter(|name| !name.is_empty())
+        {
+            let identity = AccountIdentity::parse(username, Some(domain));
+            raw.insert(
+                "username".to_string(),
+                Value::String(identity.qualified().to_string()),
+            );
+            raw.remove("domain");
+        }
+    }
+    raw.remove("callback");
+}
+const DEFAULT_TIMEOUT_MS: u64 = 10_000;
 /// How often the installed background task checks the connection. A task that
 /// does not run is not worth installing, so this is on by default; setting the
 /// key to `0` switches the interval off.
@@ -83,32 +103,30 @@ pub enum Storage {
 pub struct Settings {
     pub portal_url: Option<String>,
     pub username: Option<String>,
-    pub domain: Option<String>,
-    pub callback: Option<String>,
-    pub connect_timeout_ms: Option<u64>,
-    pub read_timeout_ms: Option<u64>,
+    pub timeout_ms: Option<u64>,
     pub reconnect_interval_secs: Option<u64>,
     pub reconnect_boot_delay_secs: Option<u64>,
+    legacy_domain: Option<String>,
+    legacy_callback: Option<String>,
+    legacy_connect_timeout_ms: Option<u64>,
+    legacy_read_timeout_ms: Option<u64>,
 }
 
 impl Settings {
     /// The values a **newly created** file is seeded with.
     ///
     /// They are the documented defaults written out, so the file shows every
-    /// key and what it means instead of being empty: `domain` with no suffix
-    /// (what the reference's own capture sends), the two timeouts, and both
-    /// background cadences off. `Settings::default()` stays the "nothing is
-    /// set" value the layering needs; this is the template for a fresh file.
+    /// current key and what it means instead of being empty. `Settings::default()`
+    /// stays the "nothing is set" value the layering needs; this is the template
+    /// for a fresh file.
     fn documented_defaults() -> Settings {
         Settings {
             portal_url: None,
             username: None,
-            domain: Some(String::new()),
-            callback: None,
-            connect_timeout_ms: Some(DEFAULT_CONNECT_MS),
-            read_timeout_ms: Some(DEFAULT_READ_MS),
+            timeout_ms: Some(DEFAULT_TIMEOUT_MS),
             reconnect_interval_secs: Some(DEFAULT_INTERVAL_SECS),
             reconnect_boot_delay_secs: Some(DEFAULT_BOOT_DELAY_SECS),
+            ..Settings::default()
         }
     }
 
@@ -121,17 +139,8 @@ impl Settings {
         if let Some(value) = &self.username {
             pairs.push(("username", Value::String(value.clone())));
         }
-        if let Some(value) = &self.domain {
-            pairs.push(("domain", Value::String(value.clone())));
-        }
-        if let Some(value) = &self.callback {
-            pairs.push(("callback", Value::String(value.clone())));
-        }
-        if let Some(value) = self.connect_timeout_ms {
-            pairs.push(("connect_timeout_ms", Value::Integer(value as i64)));
-        }
-        if let Some(value) = self.read_timeout_ms {
-            pairs.push(("read_timeout_ms", Value::Integer(value as i64)));
+        if let Some(value) = self.timeout_ms {
+            pairs.push(("timeout_ms", Value::Integer(value as i64)));
         }
         if let Some(value) = self.reconnect_interval_secs {
             pairs.push(("reconnect_interval_secs", Value::Integer(value as i64)));
@@ -142,18 +151,20 @@ impl Settings {
         pairs
     }
 
-    /// Read this version's keys out of a parsed table, reporting the first key
-    /// whose type is wrong.
+    /// Read current and legacy keys out of a parsed table, reporting the first
+    /// key whose type is wrong. Legacy values are kept only long enough to
+    /// preserve behavior until the next configuration write.
     fn from_table(table: &toml::Table, path: &Path) -> Result<Settings, ConfigError> {
         Ok(Settings {
             portal_url: optional_string(table, "portal_url", path)?,
             username: optional_string(table, "username", path)?,
-            domain: optional_string(table, "domain", path)?,
-            callback: optional_string(table, "callback", path)?,
-            connect_timeout_ms: optional_millis(table, "connect_timeout_ms", path)?,
-            read_timeout_ms: optional_millis(table, "read_timeout_ms", path)?,
+            timeout_ms: optional_millis(table, "timeout_ms", path)?,
             reconnect_interval_secs: optional_millis(table, "reconnect_interval_secs", path)?,
             reconnect_boot_delay_secs: optional_millis(table, "reconnect_boot_delay_secs", path)?,
+            legacy_domain: optional_string(table, "domain", path)?,
+            legacy_callback: optional_string(table, "callback", path)?,
+            legacy_connect_timeout_ms: optional_millis(table, "connect_timeout_ms", path)?,
+            legacy_read_timeout_ms: optional_millis(table, "read_timeout_ms", path)?,
         })
     }
 }
@@ -238,9 +249,14 @@ impl ConfigFile {
         Ok(file)
     }
 
-    /// Merge `changes` into the file and write it back when the result differs
-    /// from what is already on disk. Returns whether it wrote.
-    pub fn update(&mut self, changes: &[(&str, Value)]) -> Result<bool, ConfigError> {
+    /// Merge `changes` into the file after migrating legacy keys, and write it
+    /// back when the result differs from what is already on disk.
+    fn update(
+        &mut self,
+        changes: &[(&str, Value)],
+        snapshot: &Effective,
+    ) -> Result<bool, ConfigError> {
+        migrate_legacy_keys(&mut self.raw, snapshot);
         for (key, value) in changes {
             self.raw.insert((*key).to_string(), value.clone());
         }
@@ -248,28 +264,29 @@ impl ConfigFile {
         self.flush()
     }
 
-    /// Remove `keys` from the file and write it back when something changed.
-    /// Unknown keys are left alone, so removing a key this version does not know
-    /// is a no-op rather than a deletion.
-    pub fn remove(&mut self, keys: &[&str]) -> Result<bool, ConfigError> {
-        let mut changed = false;
+    /// Remove current keys after migrating legacy keys. Unknown keys are left
+    /// alone. User removals happen after migration, so an explicit unset wins.
+    fn remove(&mut self, keys: &[&str], snapshot: &Effective) -> Result<bool, ConfigError> {
+        let before = self.raw.clone();
+        migrate_legacy_keys(&mut self.raw, snapshot);
         for key in keys {
             if KEY_CATALOGUE.iter().any(|entry| entry.name == *key) {
-                changed |= self.raw.remove(*key).is_some();
+                self.raw.remove(*key);
             }
         }
-        if !changed {
+        if self.raw == before {
             return Ok(false);
         }
         self.settings = Settings::from_table(&self.raw, &self.path)?;
         self.flush()
     }
 
-    /// Every key the file currently sets, in the catalogue's order, with the
-    /// TOML value as text — what `config list` prints.
+    /// Every key the file currently sets, in the current-catalogue order, with
+    /// legacy compatibility keys appended when present.
     pub fn entries(&self) -> Vec<(&'static str, String)> {
         KEY_CATALOGUE
             .iter()
+            .chain(LEGACY_KEY_CATALOGUE.iter())
             .filter_map(|entry| {
                 self.raw
                     .get(entry.name)
@@ -279,9 +296,8 @@ impl ConfigFile {
     }
 }
 
-/// What every configuration key is for. This is the single list the CLI uses to
-/// validate `config set`, to document `config show`, and to decide what is safe
-/// to delete — the same names `Settings::from_table` reads.
+/// The current writable configuration keys. Legacy keys are intentionally
+/// absent so `config set` and `config unset` cannot create or manage them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeySpec {
     pub name: &'static str,
@@ -310,7 +326,7 @@ impl KeyKind {
     }
 }
 
-/// Every key this version understands, in the order the header lists them.
+/// Current writable keys, in the order used by the generated file header.
 pub const KEY_CATALOGUE: &[KeySpec] = &[
     KeySpec {
         name: "portal_url",
@@ -323,24 +339,9 @@ pub const KEY_CATALOGUE: &[KeySpec] = &[
         about: "account used as the default for the login prompt",
     },
     KeySpec {
-        name: "domain",
-        kind: KeyKind::Str,
-        about: "suffix appended to an account that carries none (with or without '@')",
-    },
-    KeySpec {
-        name: "callback",
-        kind: KeyKind::Str,
-        about: "JSONP callback name",
-    },
-    KeySpec {
-        name: "connect_timeout_ms",
+        name: "timeout_ms",
         kind: KeyKind::Count,
-        about: "HTTP connect timeout in milliseconds",
-    },
-    KeySpec {
-        name: "read_timeout_ms",
-        kind: KeyKind::Count,
-        about: "HTTP read timeout in milliseconds",
+        about: "HTTP connection and read timeout in milliseconds",
     },
     KeySpec {
         name: "reconnect_interval_secs",
@@ -354,6 +355,31 @@ pub const KEY_CATALOGUE: &[KeySpec] = &[
     },
 ];
 
+/// Legacy keys accepted while reading old files and shown read-only until the
+/// next configuration write migrates them.
+pub const LEGACY_KEY_CATALOGUE: &[KeySpec] = &[
+    KeySpec {
+        name: "domain",
+        kind: KeyKind::Str,
+        about: "legacy account suffix; use username = \"user@domain\"",
+    },
+    KeySpec {
+        name: "callback",
+        kind: KeyKind::Str,
+        about: "legacy JSONP callback; new files use the protocol default",
+    },
+    KeySpec {
+        name: "connect_timeout_ms",
+        kind: KeyKind::Count,
+        about: "legacy HTTP connect timeout; migrated to timeout_ms on write",
+    },
+    KeySpec {
+        name: "read_timeout_ms",
+        kind: KeyKind::Count,
+        about: "legacy HTTP read timeout; migrated to timeout_ms on write",
+    },
+];
+
 /// The catalogue entry for `name`, if this version has one.
 pub fn key_spec(name: &str) -> Option<&'static KeySpec> {
     KEY_CATALOGUE.iter().find(|entry| entry.name == name)
@@ -362,9 +388,8 @@ pub fn key_spec(name: &str) -> Option<&'static KeySpec> {
 /// Parse `text` as the kind of value `key` holds, or explain what was wrong.
 ///
 /// Deliberately strict: the file must keep holding the type
-/// `Settings::from_table` expects, so `config set connect_timeout_ms abc` is
-/// refused here rather than turning into a broken file that the next run
-/// reports as corrupt.
+/// `Settings::from_table` expects. Legacy keys are accepted for reading but are
+/// not accepted by `config set`.
 pub fn parse_key_value(key: &str, text: &str) -> Result<Value, String> {
     let Some(spec) = key_spec(key) else {
         return Err(format!("Unknown configuration key: {key}"));
@@ -372,7 +397,11 @@ pub fn parse_key_value(key: &str, text: &str) -> Result<Value, String> {
     match spec.kind {
         KeyKind::Str => Ok(Value::String(text.to_string())),
         KeyKind::Count => match text.parse::<u64>() {
-            Ok(number) => Ok(Value::Integer(number as i64)),
+            Ok(number) if number <= i64::MAX as u64 => Ok(Value::Integer(number as i64)),
+            Ok(_) => Err(format!(
+                "key \"{key}\" must be no greater than {}",
+                i64::MAX
+            )),
             Err(_) => Err(format!(
                 "key \"{key}\" must be {}",
                 KeyKind::Count.describe()
@@ -451,8 +480,8 @@ impl Effective {
             domain: None,
             callback: crate::api::DEFAULT_CALLBACK.to_string(),
             timeouts: Timeouts {
-                connect_ms: DEFAULT_CONNECT_MS,
-                read_ms: DEFAULT_READ_MS,
+                connect_ms: DEFAULT_TIMEOUT_MS,
+                read_ms: DEFAULT_TIMEOUT_MS,
             },
             reconnect_interval_secs: Some(DEFAULT_INTERVAL_SECS),
             reconnect_boot_delay_secs: Some(DEFAULT_BOOT_DELAY_SECS),
@@ -460,15 +489,20 @@ impl Effective {
         for layer in layers {
             overlay(&mut effective.portal_url, &layer.portal_url);
             overlay(&mut effective.username, &layer.username);
-            overlay(&mut effective.domain, &layer.domain);
-            if let Some(callback) = &layer.callback {
+            overlay(&mut effective.domain, &layer.legacy_domain);
+            if let Some(callback) = &layer.legacy_callback {
                 effective.callback = callback.clone();
             }
-            if let Some(ms) = layer.connect_timeout_ms {
+            if let Some(ms) = layer.timeout_ms {
                 effective.timeouts.connect_ms = ms;
-            }
-            if let Some(ms) = layer.read_timeout_ms {
                 effective.timeouts.read_ms = ms;
+            } else {
+                if let Some(ms) = layer.legacy_connect_timeout_ms {
+                    effective.timeouts.connect_ms = ms;
+                }
+                if let Some(ms) = layer.legacy_read_timeout_ms {
+                    effective.timeouts.read_ms = ms;
+                }
             }
             // `0` is the way to switch one off in a later layer, so it must
             // overwrite rather than be skipped like an unset key.
@@ -487,6 +521,14 @@ impl Default for Effective {
     fn default() -> Self {
         Effective::layered(&[])
     }
+}
+
+fn layered_with_legacy(layers: &[&Settings], legacy_url: Option<&str>) -> Effective {
+    let mut effective = Effective::layered(layers);
+    if effective.portal_url.is_none() {
+        effective.portal_url = legacy_url.map(str::to_string);
+    }
+    effective
 }
 
 fn overlay<T: Clone>(slot: &mut Option<T>, layer: &Option<T>) {
@@ -558,6 +600,45 @@ pub struct Resolution {
     pub created: bool,
     /// The legacy file that seeded a newly created configuration.
     pub imported_legacy: Option<PathBuf>,
+    lower: Option<Settings>,
+    legacy_url: Option<String>,
+}
+
+impl Resolution {
+    /// Persist changes in the selected file, then recompute all effective
+    /// values from the same layering and legacy fallback used during resolve.
+    pub fn update(&mut self, changes: &[(&str, Value)]) -> Result<bool, ConfigError> {
+        let snapshot = self.effective.clone();
+        let base = self.base.as_mut().ok_or_else(|| {
+            ConfigError::Io("No configuration file is available for update".to_string())
+        })?;
+        let written = base.update(changes, &snapshot)?;
+        self.refresh();
+        Ok(written)
+    }
+
+    /// Remove current keys from the selected file, then expose the lower layer
+    /// or documented default immediately.
+    pub fn remove(&mut self, keys: &[&str]) -> Result<bool, ConfigError> {
+        let snapshot = self.effective.clone();
+        let base = self.base.as_mut().ok_or_else(|| {
+            ConfigError::Io("No configuration file is available for update".to_string())
+        })?;
+        let written = base.remove(keys, &snapshot)?;
+        self.refresh();
+        Ok(written)
+    }
+
+    fn refresh(&mut self) {
+        let mut layers = Vec::with_capacity(2);
+        if let Some(lower) = self.lower.as_ref() {
+            layers.push(lower);
+        }
+        if let Some(base) = self.base.as_ref() {
+            layers.push(&base.settings);
+        }
+        self.effective = layered_with_legacy(&layers, self.legacy_url.as_deref());
+    }
 }
 
 /// Load the configuration, creating it when there is none.
@@ -580,13 +661,15 @@ pub fn resolve(
                 true,
             ),
         };
-        let effective = Effective::layered(&[&file.settings]);
+        let effective = layered_with_legacy(&[&file.settings], None);
         return Ok(Resolution {
             effective,
             base_path: Some(file.path.clone()),
             base: Some(file),
             created,
             imported_legacy: None,
+            lower: None,
+            legacy_url: None,
         });
     }
 
@@ -635,10 +718,12 @@ pub fn resolve(
     if let Some(file) = portable.as_ref() {
         layers.push(&file.settings);
     }
-    let mut effective = Effective::layered(&layers);
-    if effective.portal_url.is_none() {
-        effective.portal_url = legacy_url;
-    }
+    let effective = layered_with_legacy(&layers, legacy_url.as_deref());
+    let lower = if portable.is_some() {
+        system.as_ref().map(|file| file.settings.clone())
+    } else {
+        None
+    };
 
     // The project file wins, so that is where the next run looks first.
     let base = portable.or(system);
@@ -648,6 +733,8 @@ pub fn resolve(
         base,
         created,
         imported_legacy,
+        lower,
+        legacy_url,
     })
 }
 
@@ -657,7 +744,7 @@ pub fn resolve(
 pub fn load_existing(paths: &Paths, explicit: Option<&Path>) -> Result<Effective, ConfigError> {
     if let Some(path) = explicit {
         return Ok(match ConfigFile::read(path)? {
-            Some(file) => Effective::layered(&[&file.settings]),
+            Some(file) => layered_with_legacy(&[&file.settings], None),
             None => Effective::default(),
         });
     }
@@ -670,11 +757,8 @@ pub fn load_existing(paths: &Paths, explicit: Option<&Path>) -> Result<Effective
     if let Some(file) = portable.as_ref() {
         layers.push(&file.settings);
     }
-    let mut effective = Effective::layered(&layers);
-    if effective.portal_url.is_none() {
-        effective.portal_url = read_legacy_url(paths);
-    }
-    Ok(effective)
+    let legacy_url = read_legacy_url(paths);
+    Ok(layered_with_legacy(&layers, legacy_url.as_deref()))
 }
 
 /// The legacy file's portal URL, or `None` when there is no legacy file, it is
@@ -787,6 +871,15 @@ mod tests {
         format!("https://{host}/srun_portal_pc?ac_id=1")
     }
 
+    fn explicit_resolution(path: &Path) -> Resolution {
+        let paths = Paths {
+            system: path.with_extension("system.toml"),
+            portable: path.with_extension("portable.toml"),
+            legacy: None,
+        };
+        resolve(&paths, Some(path), None, &mut never_asked).unwrap()
+    }
+
     #[test]
     fn unknown_keys_survive_rewrites() {
         let dir = TempDir::new("unknown");
@@ -796,10 +889,19 @@ mod tests {
             "portal_url = \"https://a/srun_portal_pc?ac_id=1\"\nextra = 1\n",
         );
 
-        let mut file = ConfigFile::read(&path).unwrap().unwrap();
-        assert_eq!(file.settings.portal_url.as_deref(), Some(&url("a")[..]));
+        let mut resolution = explicit_resolution(&path);
+        assert_eq!(
+            resolution
+                .base
+                .as_ref()
+                .unwrap()
+                .settings
+                .portal_url
+                .as_deref(),
+            Some(&url("a")[..])
+        );
 
-        let written = file
+        let written = resolution
             .update(&[("portal_url", Value::String(url("b")))])
             .unwrap();
         assert!(written, "a changed value is written");
@@ -812,16 +914,265 @@ mod tests {
     }
 
     #[test]
+    fn legacy_keys_work_until_the_next_write_then_migrate() {
+        let dir = TempDir::new("legacy-migration");
+        let path = dir.path().join(CONFIG_FILE_NAME);
+        write(
+            &path,
+            "username = \"testuser\"\n\
+             domain = \"szu\"\n\
+             callback = \"cb\"\n\
+             connect_timeout_ms = 5000\n\
+             read_timeout_ms = 12000\n",
+        );
+
+        let mut resolution = explicit_resolution(&path);
+        let effective = resolution.effective.clone();
+        assert_eq!(effective.domain.as_deref(), Some("szu"));
+        assert_eq!(effective.callback, "cb");
+        assert_eq!(effective.timeouts.connect_ms, 5000);
+        assert_eq!(effective.timeouts.read_ms, 12000);
+        let names: Vec<&str> = resolution
+            .base
+            .as_ref()
+            .unwrap()
+            .entries()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "username",
+                "domain",
+                "callback",
+                "connect_timeout_ms",
+                "read_timeout_ms",
+            ]
+        );
+
+        resolution
+            .update(&[("username", Value::String("next".to_string()))])
+            .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("domain ="));
+        assert!(!text.contains("callback ="));
+        assert!(!text.contains("connect_timeout_ms ="));
+        assert!(!text.contains("read_timeout_ms ="));
+        assert!(text.contains("timeout_ms = 12000"));
+
+        let reread = ConfigFile::read(&path).unwrap().unwrap();
+        assert_eq!(reread.settings.username.as_deref(), Some("next"));
+        assert_eq!(reread.settings.timeout_ms, Some(12000));
+    }
+
+    #[test]
+    fn legacy_timeout_migration_uses_the_prewrite_effective_maximum() {
+        for (tag, body, expected) in [
+            ("connect-only", "connect_timeout_ms = 5000\n", 10_000),
+            ("read-only", "read_timeout_ms = 12000\n", 12_000),
+        ] {
+            let dir = TempDir::new(tag);
+            let path = dir.path().join(CONFIG_FILE_NAME);
+            write(&path, body);
+            let mut resolution = explicit_resolution(&path);
+
+            resolution
+                .update(&[("username", Value::String("alice".to_string()))])
+                .unwrap();
+
+            let file = ConfigFile::read(&path).unwrap().unwrap();
+            assert_eq!(file.settings.timeout_ms, Some(expected));
+            assert_eq!(resolution.effective.timeouts.connect_ms, expected);
+            assert_eq!(resolution.effective.timeouts.read_ms, expected);
+            let text = std::fs::read_to_string(path).unwrap();
+            assert!(!text.contains("connect_timeout_ms"));
+            assert!(!text.contains("read_timeout_ms"));
+        }
+    }
+
+    #[test]
+    fn layered_timeout_migration_preserves_the_larger_effective_value() {
+        for (tag, system_body, expected) in [
+            ("lower-legacy", "read_timeout_ms = 12000\n", 12_000),
+            ("lower-current", "timeout_ms = 15000\n", 15_000),
+        ] {
+            let dir = TempDir::new(tag);
+            let paths = scratch_paths(&dir);
+            write(&paths.system, system_body);
+            write(&paths.portable, "connect_timeout_ms = 5000\n");
+            let system_before = std::fs::read_to_string(&paths.system).unwrap();
+            let mut resolution = resolve(&paths, None, None, &mut never_asked).unwrap();
+
+            resolution
+                .update(&[("username", Value::String("alice".to_string()))])
+                .unwrap();
+
+            assert_eq!(
+                std::fs::read_to_string(&paths.system).unwrap(),
+                system_before
+            );
+            let portable = ConfigFile::read(&paths.portable).unwrap().unwrap();
+            assert_eq!(portable.settings.timeout_ms, Some(expected));
+            assert_eq!(resolution.effective.timeouts.connect_ms, expected);
+            assert_eq!(resolution.effective.timeouts.read_ms, expected);
+        }
+    }
+
+    #[test]
+    fn explicit_timeout_set_and_unset_win_after_migration() {
+        let dir = TempDir::new("timeout-set-unset");
+        let path = dir.path().join(CONFIG_FILE_NAME);
+        write(
+            &path,
+            "connect_timeout_ms = 5000\nread_timeout_ms = 12000\n",
+        );
+        let mut resolution = explicit_resolution(&path);
+        resolution
+            .update(&[("timeout_ms", Value::Integer(7000))])
+            .unwrap();
+        let file = ConfigFile::read(&path).unwrap().unwrap();
+        assert_eq!(file.settings.timeout_ms, Some(7000));
+        assert_eq!(file.settings.legacy_connect_timeout_ms, None);
+        assert_eq!(file.settings.legacy_read_timeout_ms, None);
+
+        write(
+            &path,
+            "timeout_ms = 9000\nconnect_timeout_ms = 5000\nread_timeout_ms = 12000\n",
+        );
+        let mut resolution = explicit_resolution(&path);
+        resolution.remove(&["timeout_ms"]).unwrap();
+        let file = ConfigFile::read(&path).unwrap().unwrap();
+        assert_eq!(file.settings.timeout_ms, None);
+        assert_eq!(file.settings.legacy_connect_timeout_ms, None);
+        assert_eq!(file.settings.legacy_read_timeout_ms, None);
+        assert_eq!(resolution.effective.timeouts, Effective::default().timeouts);
+    }
+
+    #[test]
+    fn layered_timeout_unset_reveals_lower_current_value() {
+        let dir = TempDir::new("layered-timeout-unset");
+        let paths = scratch_paths(&dir);
+        write(&paths.system, "timeout_ms = 15000\n");
+        write(
+            &paths.portable,
+            "timeout_ms = 9000\nconnect_timeout_ms = 5000\n",
+        );
+        let mut resolution = resolve(&paths, None, None, &mut never_asked).unwrap();
+
+        resolution.remove(&["timeout_ms"]).unwrap();
+
+        let portable = ConfigFile::read(&paths.portable).unwrap().unwrap();
+        assert_eq!(portable.settings.timeout_ms, None);
+        assert_eq!(portable.settings.legacy_connect_timeout_ms, None);
+        assert_eq!(resolution.effective.timeouts.connect_ms, 15_000);
+        assert_eq!(resolution.effective.timeouts.read_ms, 15_000);
+    }
+
+    #[test]
+    fn current_timeout_survives_unrelated_write_while_legacy_timeout_is_removed() {
+        let dir = TempDir::new("current-and-legacy-timeout");
+        let path = dir.path().join(CONFIG_FILE_NAME);
+        write(&path, "timeout_ms = 9000\nconnect_timeout_ms = 5000\n");
+        let mut resolution = explicit_resolution(&path);
+
+        resolution
+            .update(&[("username", Value::String("alice".to_string()))])
+            .unwrap();
+
+        let file = ConfigFile::read(&path).unwrap().unwrap();
+        assert_eq!(file.settings.timeout_ms, Some(9000));
+        assert_eq!(file.settings.legacy_connect_timeout_ms, None);
+        assert_eq!(resolution.effective.timeouts.connect_ms, 9000);
+        assert_eq!(resolution.effective.timeouts.read_ms, 9000);
+    }
+
+    #[test]
+    fn domain_migration_materializes_the_effective_qualified_username() {
+        for (tag, username, domain, expected) in [
+            ("plain-domain", "alice", "szu", "alice@szu"),
+            ("at-domain", "alice", "@szu", "alice@szu"),
+            ("embedded-domain", "alice@staff", "student", "alice@staff"),
+            ("trailing-at", "alice@", "szu", "alice@@szu"),
+        ] {
+            let dir = TempDir::new(tag);
+            let path = dir.path().join(CONFIG_FILE_NAME);
+            write(
+                &path,
+                &format!("username = \"{username}\"\ndomain = \"{domain}\"\n"),
+            );
+            let mut resolution = explicit_resolution(&path);
+
+            resolution
+                .update(&[("portal_url", Value::String(url("portal")))])
+                .unwrap();
+
+            let file = ConfigFile::read(&path).unwrap().unwrap();
+            assert_eq!(file.settings.username.as_deref(), Some(expected));
+            assert_eq!(file.settings.legacy_domain, None);
+            assert_eq!(resolution.effective.username.as_deref(), Some(expected));
+            assert_eq!(resolution.effective.domain, None);
+        }
+    }
+
+    #[test]
+    fn domain_migration_uses_lower_username_or_waits_without_one() {
+        let dir = TempDir::new("layered-domain");
+        let paths = scratch_paths(&dir);
+        write(&paths.system, "username = \"alice\"\n");
+        write(&paths.portable, "domain = \"szu\"\n");
+        let mut resolution = resolve(&paths, None, None, &mut never_asked).unwrap();
+
+        resolution
+            .update(&[("portal_url", Value::String(url("portal")))])
+            .unwrap();
+
+        let portable = ConfigFile::read(&paths.portable).unwrap().unwrap();
+        assert_eq!(portable.settings.username.as_deref(), Some("alice@szu"));
+        assert_eq!(portable.settings.legacy_domain, None);
+        assert_eq!(resolution.effective.username.as_deref(), Some("alice@szu"));
+
+        let delayed = dir.path().join("delayed.toml");
+        write(&delayed, "domain = \"szu\"\n");
+        let mut resolution = explicit_resolution(&delayed);
+        resolution
+            .update(&[("portal_url", Value::String(url("portal")))])
+            .unwrap();
+        let file = ConfigFile::read(&delayed).unwrap().unwrap();
+        assert_eq!(file.settings.username, None);
+        assert_eq!(file.settings.legacy_domain.as_deref(), Some("szu"));
+    }
+
+    #[test]
+    fn callback_removal_refreshes_effective_state_immediately() {
+        let dir = TempDir::new("callback-refresh");
+        let path = dir.path().join(CONFIG_FILE_NAME);
+        write(&path, "callback = \"legacy\"\n");
+        let mut resolution = explicit_resolution(&path);
+        assert_eq!(resolution.effective.callback, "legacy");
+
+        resolution
+            .update(&[("username", Value::String("alice".to_string()))])
+            .unwrap();
+
+        assert_eq!(resolution.effective.callback, crate::api::DEFAULT_CALLBACK);
+        assert!(!std::fs::read_to_string(path)
+            .unwrap()
+            .contains("callback ="));
+    }
+
+    #[test]
     fn update_writes_only_on_change() {
         let dir = TempDir::new("nochange");
         let path = dir.path().join(CONFIG_FILE_NAME);
-        let mut file = ConfigFile::create(&path, &Settings::default()).unwrap();
+        ConfigFile::create(&path, &Settings::default()).unwrap();
+        let mut resolution = explicit_resolution(&path);
 
-        assert!(file
+        assert!(resolution
             .update(&[("portal_url", Value::String(url("a")))])
             .unwrap());
         let after_first = std::fs::read_to_string(&path).unwrap();
-        assert!(!file
+        assert!(!resolution
             .update(&[("portal_url", Value::String(url("a")))])
             .unwrap());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), after_first);
@@ -848,7 +1199,7 @@ mod tests {
         assert_eq!(resolution.effective.reconnect_interval_secs, Some(60));
         // The system file still supplies what the project file does not set.
         assert_eq!(resolution.effective.timeouts.connect_ms, 100);
-        assert_eq!(resolution.effective.timeouts.read_ms, DEFAULT_READ_MS);
+        assert_eq!(resolution.effective.timeouts.read_ms, DEFAULT_TIMEOUT_MS);
         // Neither file sets this one, so the documented default applies.
         assert_eq!(resolution.effective.reconnect_boot_delay_secs, Some(30));
     }
@@ -1052,8 +1403,8 @@ mod tests {
         assert_eq!(
             effective.timeouts,
             Timeouts {
-                connect_ms: DEFAULT_CONNECT_MS,
-                read_ms: DEFAULT_READ_MS,
+                connect_ms: DEFAULT_TIMEOUT_MS,
+                read_ms: DEFAULT_TIMEOUT_MS,
             }
         );
         assert_eq!(effective.portal_url, None);
@@ -1064,9 +1415,10 @@ mod tests {
     }
 
     #[test]
-    fn the_catalogue_covers_every_key_the_loader_reads() {
-        // The catalogue is what `config set`/`unset` validate against, so a key
-        // the loader understands but the catalogue misses would be unsettable.
+    fn the_catalogue_covers_every_current_writable_key() {
+        // The current catalogue is what `config set`/`unset` validate against.
+        // Legacy keys have a separate read-only catalogue and are intentionally
+        // excluded from this check.
         let dir = TempDir::new("catalogue");
         let path = dir.path().join(CONFIG_FILE_NAME);
         let mut raw = toml::Table::new();
@@ -1099,41 +1451,53 @@ mod tests {
     fn config_set_and_unset_write_through_the_file() {
         let dir = TempDir::new("set-unset");
         let path = dir.path().join(CONFIG_FILE_NAME);
-        let mut file = ConfigFile::create(&path, &Settings::documented_defaults()).unwrap();
+        ConfigFile::create(&path, &Settings::documented_defaults()).unwrap();
+        let mut resolution = explicit_resolution(&path);
 
         // `set` accepts what the key's type allows, and refuses the rest.
         let value = parse_key_value("username", "testuser").unwrap();
         assert_eq!(value, Value::String("testuser".to_string()));
         assert_eq!(
-            parse_key_value("read_timeout_ms", "20000").unwrap(),
+            parse_key_value("timeout_ms", "20000").unwrap(),
             Value::Integer(20_000)
         );
         assert_eq!(
-            parse_key_value("read_timeout_ms", "soon").unwrap_err(),
-            "key \"read_timeout_ms\" must be a non-negative integer"
+            parse_key_value("timeout_ms", "soon").unwrap_err(),
+            "key \"timeout_ms\" must be a non-negative integer"
+        );
+        assert_eq!(
+            parse_key_value("timeout_ms", &(i64::MAX as u128 + 1).to_string()).unwrap_err(),
+            "key \"timeout_ms\" must be no greater than 9223372036854775807"
+        );
+        assert_eq!(
+            parse_key_value("read_timeout_ms", "20000").unwrap_err(),
+            "Unknown configuration key: read_timeout_ms"
         );
         assert_eq!(
             parse_key_value("nope", "x").unwrap_err(),
             "Unknown configuration key: nope"
         );
 
-        file.update(&[("username", value)]).unwrap();
-        file.update(&[("reconnect_interval_secs", Value::Integer(600))])
+        resolution.update(&[("username", value)]).unwrap();
+        resolution
+            .update(&[("reconnect_interval_secs", Value::Integer(600))])
             .unwrap();
         let reread = ConfigFile::read(&path).unwrap().unwrap();
         assert_eq!(reread.settings.username.as_deref(), Some("testuser"));
         assert_eq!(reread.settings.reconnect_interval_secs, Some(600));
 
         // Removing one key leaves the others, and a second remove is a no-op.
-        assert!(file.remove(&["reconnect_interval_secs"]).unwrap());
-        assert!(!file.remove(&["reconnect_interval_secs"]).unwrap());
+        assert!(resolution.remove(&["reconnect_interval_secs"]).unwrap());
+        assert!(!resolution.remove(&["reconnect_interval_secs"]).unwrap());
         let reread = ConfigFile::read(&path).unwrap().unwrap();
         assert_eq!(reread.settings.reconnect_interval_secs, None);
         assert_eq!(reread.settings.username.as_deref(), Some("testuser"));
 
         // A key this version does not know is not deleted by name.
-        file.update(&[("future_key", Value::Integer(1))]).unwrap();
-        assert!(!file.remove(&["future_key"]).unwrap());
+        resolution
+            .update(&[("future_key", Value::Integer(1))])
+            .unwrap();
+        assert!(!resolution.remove(&["future_key"]).unwrap());
         assert_eq!(
             ConfigFile::read(&path)
                 .unwrap()
@@ -1148,11 +1512,13 @@ mod tests {
     fn unsetting_returns_to_the_documented_defaults() {
         let dir = TempDir::new("unset-defaults");
         let path = dir.path().join(CONFIG_FILE_NAME);
-        let mut file = ConfigFile::create(&path, &Settings::documented_defaults()).unwrap();
-        file.update(&[("reconnect_interval_secs", Value::Integer(600))])
+        ConfigFile::create(&path, &Settings::documented_defaults()).unwrap();
+        let mut resolution = explicit_resolution(&path);
+        resolution
+            .update(&[("reconnect_interval_secs", Value::Integer(600))])
             .unwrap();
 
-        file.remove(&["reconnect_interval_secs"]).unwrap();
+        resolution.remove(&["reconnect_interval_secs"]).unwrap();
 
         // Gone from the file, so the documented default applies again.
         let reread = ConfigFile::read(&path).unwrap().unwrap();
@@ -1170,18 +1536,19 @@ mod tests {
         ConfigFile::create(&paths.system, &Settings::documented_defaults()).unwrap();
 
         let text = std::fs::read_to_string(&paths.system).unwrap();
-        // Every documented key is present with its default, including `domain`
-        // and both cadences switched off (`0`).
+        // Every current key is present with its default.
         for line in [
-            "domain = \"\"",
-            "connect_timeout_ms = 5000",
-            "read_timeout_ms = 10000",
+            "timeout_ms = 10000",
             "reconnect_interval_secs = 300",
             "reconnect_boot_delay_secs = 30",
         ] {
             assert!(text.contains(line), "{line} missing from:\n{text}");
         }
-        // Nothing else was invented.
+        // Nothing obsolete was invented.
+        assert!(!text.contains("domain ="), "{text}");
+        assert!(!text.contains("callback ="), "{text}");
+        assert!(!text.contains("connect_timeout_ms ="), "{text}");
+        assert!(!text.contains("read_timeout_ms ="), "{text}");
         assert!(!text.contains("username ="), "{text}");
         assert!(!text.contains("portal_url ="), "{text}");
 
@@ -1191,7 +1558,7 @@ mod tests {
         assert_eq!(effective.reconnect_interval_secs, Some(300));
         assert_eq!(effective.reconnect_boot_delay_secs, Some(30));
         assert_eq!(effective.timeouts, Effective::default().timeouts);
-        assert_eq!(effective.domain.as_deref(), Some(""));
+        assert_eq!(effective.domain, None);
     }
 
     #[test]

@@ -41,6 +41,8 @@
 //! documented in `README.md` and in the doc comment of the code that implements
 //! it.
 
+mod account;
+
 pub mod api;
 pub mod cli;
 pub mod config;
