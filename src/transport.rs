@@ -195,7 +195,7 @@ fn split_origin(origin: &str) -> (&str, &str) {
 }
 
 /// Transport-level failure.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransportError {
     /// The request itself failed (connection, status, body read).
     Http(String),

@@ -29,11 +29,18 @@ use crate::translate::Translate;
 use crate::transport::Endpoints;
 use crate::util::{self, Task};
 
+/// `checkOnlineMaxNum`-shaped bound for the `ip_already_online_error` retry: the
+/// login is sent at most this many times before it is reported as failed.
+pub const MAX_LOGIN_ATTEMPTS: u32 = 3;
+
 /// SPEC §11 `PortalError`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PortalError {
-    /// Displayed as `Get portal config error: …` (SPEC §10).
-    ConfigFetch(String),
+    /// The configuration page could not be fetched (displayed as
+    /// `Get portal config error: …`, SPEC §10).
+    ConfigFetch(crate::transport::TransportError),
+    /// The configuration page was fetched but could not be read.
+    ConfigParse(String),
     CliVersionTooLow,
     Api {
         error: String,
@@ -45,7 +52,7 @@ pub enum PortalError {
     LoginFailed,
     LogoutFailed,
     Timeout,
-    Transport(String),
+    Transport(crate::transport::TransportError),
     MissingField {
         endpoint: &'static str,
         field: &'static str,
@@ -84,6 +91,7 @@ impl std::fmt::Display for PortalError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PortalError::ConfigFetch(err) => write!(f, "Get portal config error: {err}"),
+            PortalError::ConfigParse(err) => write!(f, "Get portal config error: {err}"),
             PortalError::CliVersionTooLow => f.write_str(crate::messages::CLI_VERSION_TOO_LOW),
             PortalError::Api {
                 error,
@@ -107,14 +115,14 @@ impl std::error::Error for PortalError {}
 
 impl From<crate::transport::TransportError> for PortalError {
     fn from(err: crate::transport::TransportError) -> Self {
-        PortalError::Transport(err.to_string())
+        PortalError::Transport(err)
     }
 }
 
 impl From<ApiError> for PortalError {
     fn from(err: ApiError) -> Self {
         match err {
-            ApiError::Transport(err) => PortalError::Transport(err.to_string()),
+            ApiError::Transport(err) => PortalError::Transport(err),
             ApiError::Api {
                 error,
                 ecode,
@@ -474,6 +482,12 @@ impl Runtime {
     }
 
     /// `coreAuth(username, password, otherStack, isOTP?)` (SPEC §7.1).
+    ///
+    /// The `ip_already_online_error` branch of SPEC §7.1 — drop the existing
+    /// binding, confirm, retry — is bounded to [`MAX_LOGIN_ATTEMPTS`] attempts.
+    /// The reference recurses without a limit, so a portal that keeps answering
+    /// the same way would make the unattended pass run forever; the requests per
+    /// attempt are exactly the reference's.
     pub fn core_auth(
         &mut self,
         username_with_domain: &str,
@@ -482,23 +496,37 @@ impl Runtime {
         is_otp: bool,
     ) -> Result<(), PortalError> {
         let ip = self.stack_ip(other_stack);
-        let res = self.send_login(username_with_domain, password, &ip, other_stack, is_otp)?;
+        for attempt in 0..MAX_LOGIN_ATTEMPTS {
+            let res = self.send_login(username_with_domain, password, &ip, other_stack, is_otp)?;
 
-        if res.get("error").and_then(Value::as_str) == Some("ok")
-            && res.get("suc_msg").and_then(Value::as_str) == Some("ip_already_online_error")
-        {
-            // SPEC §7.1: drop the existing binding, confirm, then retry as-is.
-            let time = now_secs();
-            let username = username_with_domain.to_string();
-            api::send_dm(&self.ep, &username, &ip, time, other_stack, &self.callback)?;
-            self.check_sign_out_success(Some(&ip))?;
-            return self.core_auth(username_with_domain, password, other_stack, is_otp);
-        }
+            if res.get("error").and_then(Value::as_str) == Some("ok")
+                && res.get("suc_msg").and_then(Value::as_str) == Some("ip_already_online_error")
+            {
+                if attempt + 1 == MAX_LOGIN_ATTEMPTS {
+                    // The conflict survived every attempt: report the login as
+                    // failed instead of recursing once more.
+                    return Err(PortalError::LoginFailed);
+                }
+                // SPEC §7.1: drop the existing binding, confirm, then retry as-is.
+                let time = now_secs();
+                api::send_dm(
+                    &self.ep,
+                    username_with_domain,
+                    &ip,
+                    time,
+                    other_stack,
+                    &self.callback,
+                )?;
+                self.check_sign_out_success(Some(&ip))?;
+                continue;
+            }
 
-        if res.get("error").and_then(Value::as_str) != Some("ok") {
-            return Err(api_error(&res));
+            if res.get("error").and_then(Value::as_str) != Some("ok") {
+                return Err(api_error(&res));
+            }
+            return self.check_sign_success(Some(&ip));
         }
-        self.check_sign_success(Some(&ip))
+        Err(PortalError::LoginFailed)
     }
 
     fn send_login(
@@ -796,7 +824,7 @@ mod tests {
         assert_eq!(err.render(&translate), "wrong password");
         assert_eq!(PortalError::LoginFailed.to_string(), "Login failed");
         assert_eq!(
-            PortalError::ConfigFetch("boom".into()).to_string(),
+            PortalError::ConfigParse("boom".into()).to_string(),
             "Get portal config error: boom"
         );
         assert_eq!(
