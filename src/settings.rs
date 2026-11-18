@@ -1,36 +1,35 @@
 //! The configuration file: discovery, layering and first-run creation.
 //!
-//! The CLI reads exactly two files, both named [`CONFIG_FILE_NAME`]:
+//! Discovery settles on a [`ConfigSource`]: an ordered list of files read low
+//! to high, the single file writes go to, and the legacy `~/.srun_portal.json`
+//! that may still supply a portal URL. By default the list is the **system**
+//! file (`$XDG_CONFIG_HOME/srun-portal`, `~/Library/Application
+//! Support/srun-portal`, `%APPDATA%\srun-portal\config`) followed by the
+//! **portable** file next to the executable; `--config`/`SRUN_PORTAL_CONFIG`
+//! replaces the list with that one file.
 //!
-//! * the **system** file, in the directory this platform has a convention for
-//!   (`$XDG_CONFIG_HOME/srun-portal`, `~/Library/Application Support/srun-portal`,
-//!   `%APPDATA%\srun-portal\config`), and
-//! * the **project** file, next to the executable — the portable deployment.
+//! Reading and initialising are separate operations. [`load_source`] only
+//! reads — a missing layer is simply absent, and a run whose layers are all
+//! missing has default values, not a new file. Only `config set`, the
+//! interactive login and `service install` create the write target, and they do
+//! it through [`Resolution::update`], which holds the file's cross-process lock
+//! while it re-reads, re-migrates and merges. Two concurrent writers therefore
+//! both land: the second one merges into what the first wrote instead of
+//! overwriting it with a stale snapshot.
 //!
-//! The project file is the project-level configuration: when it is present it
-//! overrides the system file key by key without copying the rest of the user's
-//! settings. Both are optional; when neither exists the CLI asks where to put
-//! one (portable when there is no terminal to ask; see [`ask_storage`]) and
-//! seeds the new file from the legacy `~/.srun_portal.json` if that file is
-//! still around.
-//!
-//! The legacy file is only ever read ([`crate::config::read_legacy`]): it is not
-//! written any more, which is the deliberate deviation from SPEC §3.1/§12 item
-//! 12 — the recorded portal URL now lives in the `portal_url` key of whichever
-//! configuration file was read first. This module stores no password: the
-//! unattended one lives in the system credential facility (see
-//! [`crate::keyring`] and [`crate::credentials`]), never in these files.
-//!
-//! Unknown keys are kept in the parsed table and written back unchanged, except
+//! Writes are atomic ([`crate::persistence`]): a reader sees the old file or the
+//! new one, never a truncated mixture. Unknown keys are kept verbatim, except
 //! for the four legacy login/timeout keys, which are migrated away on the next
-//! configuration write.
+//! write. No password is ever stored here.
 
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
 use toml::Value;
 
 use crate::account::AccountIdentity;
 use crate::config::{self, ConfigError};
+use crate::persistence::FileLock;
 use crate::sys;
 use crate::transport::Timeouts;
 
@@ -51,6 +50,7 @@ const HEADER: &str = "\
 #   reconnect_interval_secs   background reconnect interval in seconds (default 300; 0: no interval)
 #   reconnect_boot_delay_secs delay after startup before the first check (default 30; 0: not at startup)
 ";
+
 fn migrate_legacy_keys(raw: &mut toml::Table, snapshot: &Effective) {
     let has_legacy_timeout =
         raw.contains_key("connect_timeout_ms") || raw.contains_key("read_timeout_ms");
@@ -85,6 +85,13 @@ const DEFAULT_INTERVAL_SECS: u64 = 300;
 /// boot-time race with the network coming up is not a failed login. `0` switches
 /// the startup run off.
 const DEFAULT_BOOT_DELAY_SECS: u64 = 30;
+
+/// The accepted range of every bounded key. A value outside it is rejected
+/// before it is written, so a hand-edited or scripted file cannot produce a
+/// timeout that never expires or a task that runs in a tight loop.
+pub const MAX_TIMEOUT_MS: u64 = 60_000;
+pub const MAX_INTERVAL_SECS: u64 = 86_340;
+pub const MAX_BOOT_DELAY_SECS: u64 = 86_400;
 
 /// Where a first-run configuration file goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -200,6 +207,15 @@ fn format_error(path: &Path, key: &str, expected: &str) -> ConfigError {
     }
 }
 
+/// Result of removing requested keys from one configuration file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoveOutcome {
+    /// Whether each input key was actually present and removed, in input order.
+    pub removed: Vec<bool>,
+    /// Whether migration or removal changed the serialized file.
+    pub written: bool,
+}
+
 /// One configuration file: its parsed settings, and the whole table it was read
 /// from so unknown keys survive a rewrite.
 #[derive(Debug, Clone)]
@@ -218,38 +234,39 @@ impl ConfigFile {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(ConfigError::Io(format!("{}: {err}", path.display()))),
         };
+        Self::parse(path, text).map(Some)
+    }
+
+    fn parse(path: &Path, text: String) -> Result<ConfigFile, ConfigError> {
         let raw: toml::Table = toml::from_str(&text).map_err(|err| ConfigError::Format {
             path: path.to_path_buf(),
             detail: err.to_string(),
         })?;
         let settings = Settings::from_table(&raw, path)?;
-        Ok(Some(ConfigFile {
+        Ok(ConfigFile {
             path: path.to_path_buf(),
             settings,
             raw,
             text,
-        }))
+        })
     }
 
-    /// Create `path` holding `seed`, creating parent directories as needed. An
-    /// existing file is overwritten: callers only reach this with a path they
-    /// have already read as missing.
-    pub fn create(path: &Path, seed: &Settings) -> Result<ConfigFile, ConfigError> {
+    /// A fresh file holding `seed`, not yet on disk. The caller holds the file's
+    /// lock, so no other process can create it in between.
+    fn fresh(path: &Path, seed: &Settings) -> ConfigFile {
         let mut raw = toml::Table::new();
         for (key, value) in seed.pairs() {
             raw.insert(key.to_string(), value);
         }
-        let mut file = ConfigFile {
+        ConfigFile {
             path: path.to_path_buf(),
             settings: seed.clone(),
             raw,
             text: String::new(),
-        };
-        file.flush()?;
-        Ok(file)
+        }
     }
 
-    /// Merge `changes` into the file after migrating legacy keys, and write it
+    /// Merge `changes` into the table after migrating legacy keys, and write it
     /// back when the result differs from what is already on disk.
     fn update(
         &mut self,
@@ -266,19 +283,22 @@ impl ConfigFile {
 
     /// Remove current keys after migrating legacy keys. Unknown keys are left
     /// alone. User removals happen after migration, so an explicit unset wins.
-    fn remove(&mut self, keys: &[&str], snapshot: &Effective) -> Result<bool, ConfigError> {
-        let before = self.raw.clone();
+    fn remove(
+        &mut self,
+        keys: &[&str],
+        snapshot: &Effective,
+    ) -> Result<RemoveOutcome, ConfigError> {
         migrate_legacy_keys(&mut self.raw, snapshot);
-        for key in keys {
-            if KEY_CATALOGUE.iter().any(|entry| entry.name == *key) {
-                self.raw.remove(*key);
-            }
-        }
-        if self.raw == before {
-            return Ok(false);
-        }
+        let removed = keys
+            .iter()
+            .map(|key| {
+                KEY_CATALOGUE.iter().any(|entry| entry.name == *key)
+                    && self.raw.remove(*key).is_some()
+            })
+            .collect();
         self.settings = Settings::from_table(&self.raw, &self.path)?;
-        self.flush()
+        let written = self.flush()?;
+        Ok(RemoveOutcome { removed, written })
     }
 
     /// Every key the file currently sets, in the current-catalogue order, with
@@ -293,6 +313,31 @@ impl ConfigFile {
                     .map(|value| (entry.name, render_value(value)))
             })
             .collect()
+    }
+
+    /// Serialize the table and replace the file atomically, unless the text is
+    /// unchanged. The caller holds the file's lock.
+    fn flush(&mut self) -> Result<bool, ConfigError> {
+        let body = toml::to_string_pretty(&self.raw).map_err(|err| ConfigError::Format {
+            path: self.path.clone(),
+            detail: err.to_string(),
+        })?;
+        let mut text = String::from(HEADER);
+        let body = body.trim_end_matches('\n');
+        if !body.is_empty() {
+            text.push('\n');
+            text.push_str(body);
+        }
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        if text == self.text {
+            return Ok(false);
+        }
+        crate::persistence::atomic_write(&self.path, text.as_bytes(), false)
+            .map_err(|err| ConfigError::Io(format!("{}: {err}", self.path.display())))?;
+        self.text = text;
+        Ok(true)
     }
 }
 
@@ -419,38 +464,6 @@ fn render_value(value: &Value) -> String {
     }
 }
 
-impl ConfigFile {
-    /// Serialize the table and write it, unless the text is unchanged.
-    fn flush(&mut self) -> Result<bool, ConfigError> {
-        let body = toml::to_string_pretty(&self.raw).map_err(|err| ConfigError::Format {
-            path: self.path.clone(),
-            detail: err.to_string(),
-        })?;
-        let mut text = String::from(HEADER);
-        let body = body.trim_end_matches('\n');
-        if !body.is_empty() {
-            text.push('\n');
-            text.push_str(body);
-        }
-        if !text.ends_with('\n') {
-            text.push('\n');
-        }
-        if text == self.text {
-            return Ok(false);
-        }
-        if let Some(parent) = self.path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|err| ConfigError::Io(format!("{}: {err}", parent.display())))?;
-            }
-        }
-        std::fs::write(&self.path, text.as_bytes())
-            .map_err(|err| ConfigError::Io(format!("{}: {err}", self.path.display())))?;
-        self.text = text;
-        Ok(true)
-    }
-}
-
 /// The settings after every layer has been applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Effective {
@@ -537,27 +550,6 @@ fn overlay<T: Clone>(slot: &mut Option<T>, layer: &Option<T>) {
     }
 }
 
-/// The paths this module works with.
-#[derive(Debug, Clone)]
-pub struct Paths {
-    /// The platform-convention file.
-    pub system: PathBuf,
-    /// The file next to the executable — the project-level one.
-    pub portable: PathBuf,
-    /// `~/.srun_portal.json`, when a home directory could be determined.
-    pub legacy: Option<PathBuf>,
-}
-
-impl Paths {
-    pub fn discover() -> Result<Paths, ConfigError> {
-        Ok(Paths {
-            system: system_config_path()?,
-            portable: portable_config_path()?,
-            legacy: config::legacy_env_file_path().ok(),
-        })
-    }
-}
-
 /// `directories::ProjectDirs::from("", "", "srun-portal").config_dir()`
 /// joined with [`CONFIG_FILE_NAME`]: `$XDG_CONFIG_HOME/srun-portal/srun-portal.toml`
 /// on Linux, `~/Library/Application Support/srun-portal/srun-portal.toml` on
@@ -585,187 +577,340 @@ pub fn portable_config_path() -> Result<PathBuf, ConfigError> {
         .join(CONFIG_FILE_NAME))
 }
 
-/// What [`resolve`] settled on.
-#[derive(Debug, Clone)]
-pub struct Resolution {
-    /// The merged settings the CLI runs with.
-    pub effective: Effective,
-    /// The file a newly resolved portal URL is recorded in: the project file
-    /// when it exists, else the system file. `None` never happens — resolution
-    /// always ends with a file.
-    pub base: Option<ConfigFile>,
-    /// [`Resolution::base`]'s path, for display.
-    pub base_path: Option<PathBuf>,
-    /// Whether this run created the file.
-    pub created: bool,
-    /// The legacy file that seeded a newly created configuration.
-    pub imported_legacy: Option<PathBuf>,
-    lower: Option<Settings>,
-    legacy_url: Option<String>,
-}
-
-impl Resolution {
-    /// Persist changes in the selected file, then recompute all effective
-    /// values from the same layering and legacy fallback used during resolve.
-    pub fn update(&mut self, changes: &[(&str, Value)]) -> Result<bool, ConfigError> {
-        let snapshot = self.effective.clone();
-        let base = self.base.as_mut().ok_or_else(|| {
-            ConfigError::Io("No configuration file is available for update".to_string())
-        })?;
-        let written = base.update(changes, &snapshot)?;
-        self.refresh();
-        Ok(written)
-    }
-
-    /// Remove current keys from the selected file, then expose the lower layer
-    /// or documented default immediately.
-    pub fn remove(&mut self, keys: &[&str]) -> Result<bool, ConfigError> {
-        let snapshot = self.effective.clone();
-        let base = self.base.as_mut().ok_or_else(|| {
-            ConfigError::Io("No configuration file is available for update".to_string())
-        })?;
-        let written = base.remove(keys, &snapshot)?;
-        self.refresh();
-        Ok(written)
-    }
-
-    fn refresh(&mut self) {
-        let mut layers = Vec::with_capacity(2);
-        if let Some(lower) = self.lower.as_ref() {
-            layers.push(lower);
-        }
-        if let Some(base) = self.base.as_ref() {
-            layers.push(&base.settings);
-        }
-        self.effective = layered_with_legacy(&layers, self.legacy_url.as_deref());
-    }
-}
-
-/// Load the configuration, creating it when there is none.
+/// Every file one run reads, in increasing precedence, and the single file it
+/// writes.
 ///
-/// `explicit` is `--config`/`SRUN_PORTAL_CONFIG`: that file is then the whole
-/// configuration and neither the system nor the project file is read.
-/// `forced` is `--portable`, which skips the first-run question. `ask` is only
-/// called when no configuration file exists at all.
-pub fn resolve(
-    paths: &Paths,
-    explicit: Option<&Path>,
-    forced: Option<Storage>,
-    ask: &mut dyn FnMut(&Paths) -> Storage,
-) -> Result<Resolution, ConfigError> {
-    if let Some(path) = explicit {
-        let (file, created) = match ConfigFile::read(path)? {
-            Some(file) => (file, false),
-            None => (
-                ConfigFile::create(path, &Settings::documented_defaults())?,
-                true,
-            ),
-        };
-        let effective = layered_with_legacy(&[&file.settings], None);
-        return Ok(Resolution {
-            effective,
-            base_path: Some(file.path.clone()),
-            base: Some(file),
-            created,
-            imported_legacy: None,
-            lower: None,
-            legacy_url: None,
-        });
-    }
+/// It is recorded in `installed.toml` so the background task reads exactly what
+/// the install read, whichever directory it is started from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigSource {
+    /// Read low to high: a later file's key wins.
+    pub layers: Vec<PathBuf>,
+    /// The only file writes go to.
+    pub write_path: PathBuf,
+    /// `~/.srun_portal.json`, consulted only for a portal URL when the layers
+    /// do not supply one. `None` for an explicit single-file source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_path: Option<PathBuf>,
+}
 
-    let mut system = ConfigFile::read(&paths.system)?;
-    let mut portable = ConfigFile::read(&paths.portable)?;
-
-    // Read once: it seeds a first-run file and is the last-resort URL.
-    let legacy_url = read_legacy_url(paths);
-    let mut created = false;
-    let mut imported_legacy = None;
-
-    if system.is_none() && portable.is_none() {
-        let mut seed = Settings::documented_defaults();
-        if let Some(url) = &legacy_url {
-            seed.portal_url = Some(url.clone());
-            imported_legacy = paths.legacy.clone();
+impl ConfigSource {
+    /// The source a run uses: the explicit path when one was given, else the
+    /// system and portable files.
+    ///
+    /// Never creates or asks. `forced` only decides where a *new* file would go
+    /// when neither exists, so `--portable` still selects the portable location
+    /// without touching the disk.
+    pub fn discover(
+        explicit: Option<&Path>,
+        forced: Option<Storage>,
+    ) -> Result<ConfigSource, ConfigError> {
+        if let Some(path) = explicit {
+            return Ok(ConfigSource {
+                layers: vec![path.to_path_buf()],
+                write_path: path.to_path_buf(),
+                legacy_path: None,
+            });
         }
-        let storage = forced.unwrap_or_else(|| ask(paths));
-        let target = match storage {
-            Storage::Portable => paths.portable.clone(),
-            Storage::System => paths.system.clone(),
-        };
-        let file = match ConfigFile::create(&target, &seed) {
-            Ok(file) => file,
-            // A portable deployment can be read-only (a shared install); the
-            // system directory is then the only writable option.
-            Err(err) if storage == Storage::Portable => {
-                eprintln!("{} is not writable: {err}", target.display());
-                ConfigFile::create(&paths.system, &seed)?
-            }
-            Err(err) => return Err(err),
-        };
-        eprintln!("Created {}", file.path.display());
-        created = true;
-        if file.path == paths.system {
-            system = Some(file);
+        let system = system_config_path()?;
+        let portable = portable_config_path()?;
+        let mut layers = vec![system.clone()];
+        if !same_physical(&system, &portable)? {
+            layers.push(portable.clone());
+        }
+        let write_path = if portable.exists() {
+            portable.clone()
+        } else if system.exists() {
+            system.clone()
         } else {
-            portable = Some(file);
+            match forced {
+                Some(Storage::Portable) => portable.clone(),
+                _ => system.clone(),
+            }
+        };
+        Ok(ConfigSource {
+            layers,
+            write_path,
+            legacy_path: config::legacy_env_file_path().ok(),
+        })
+    }
+
+    /// A source with one file, for tests and for a caller that already knows
+    /// the path it wants.
+    pub fn single(path: impl Into<PathBuf>) -> ConfigSource {
+        let path = path.into();
+        ConfigSource {
+            layers: vec![path.clone()],
+            write_path: path,
+            legacy_path: None,
         }
     }
 
-    let mut layers: Vec<&Settings> = Vec::new();
-    if let Some(file) = system.as_ref() {
-        layers.push(&file.settings);
+    /// Whether any layer exists. A source with nothing on disk has default
+    /// values only.
+    pub fn exists(&self) -> Result<bool, ConfigError> {
+        for layer in &self.layers {
+            if layer.is_file() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
-    if let Some(file) = portable.as_ref() {
-        layers.push(&file.settings);
-    }
-    let effective = layered_with_legacy(&layers, legacy_url.as_deref());
-    let lower = if portable.is_some() {
-        system.as_ref().map(|file| file.settings.clone())
-    } else {
-        None
-    };
 
-    // The project file wins, so that is where the next run looks first.
-    let base = portable.or(system);
-    Ok(Resolution {
-        effective,
-        base_path: base.as_ref().map(|file| file.path.clone()),
-        base,
-        created,
-        imported_legacy,
-        lower,
-        legacy_url,
+    /// The system and portable locations this platform uses, for the first-run
+    /// question.
+    pub fn locations(&self) -> (PathBuf, PathBuf) {
+        match self.layers.as_slice() {
+            [system] => (system.clone(), system.clone()),
+            [system, portable, ..] => (system.clone(), portable.clone()),
+            [] => (self.write_path.clone(), self.write_path.clone()),
+        }
+    }
+}
+
+fn same_physical(left: &Path, right: &Path) -> Result<bool, ConfigError> {
+    if left == right {
+        return Ok(true);
+    }
+    if !left.exists() || !right.exists() {
+        return Ok(false);
+    }
+    same_file::is_same_file(left, right).map_err(|err| {
+        ConfigError::Io(format!(
+            "cannot compare configuration files {} and {}: {err}",
+            left.display(),
+            right.display()
+        ))
     })
 }
 
-/// The effective settings of the files that already exist. Never creates,
-/// asks, or writes: the read-only caller (`examples/live_check.rs`) must not
-/// touch the user's home.
-pub fn load_existing(paths: &Paths, explicit: Option<&Path>) -> Result<Effective, ConfigError> {
-    if let Some(path) = explicit {
-        return Ok(match ConfigFile::read(path)? {
-            Some(file) => layered_with_legacy(&[&file.settings], None),
-            None => Effective::default(),
-        });
+/// What [`load_source`] read.
+#[derive(Debug, Clone)]
+pub struct Loaded {
+    /// The merged settings.
+    pub effective: Effective,
+    /// The layers that exist, low to high.
+    pub files: Vec<ConfigFile>,
+    /// The legacy file that supplied the portal URL, if any.
+    pub imported_legacy: Option<PathBuf>,
+}
+
+/// Read every layer of `source` and merge them, low to high.
+///
+/// Read-only: a missing layer is skipped, and a source whose layers are all
+/// missing yields the documented defaults. Deciding whether those defaults are
+/// enough is [`validate`]'s job, not this one's.
+pub fn load_source(source: &ConfigSource) -> Result<Loaded, ConfigError> {
+    let mut files: Vec<ConfigFile> = Vec::new();
+    for layer in &source.layers {
+        let Some(file) = ConfigFile::read(layer)? else {
+            continue;
+        };
+        if files
+            .last()
+            .is_some_and(|seen| same_physical(&seen.path, &file.path).unwrap_or(false))
+        {
+            continue;
+        }
+        files.push(file);
     }
-    let system = ConfigFile::read(&paths.system)?;
-    let portable = ConfigFile::read(&paths.portable)?;
-    let mut layers: Vec<&Settings> = Vec::new();
-    if let Some(file) = system.as_ref() {
-        layers.push(&file.settings);
+    let legacy_url = read_legacy_url(source.legacy_path.as_deref());
+    let layers: Vec<&Settings> = files.iter().map(|file| &file.settings).collect();
+    let effective = layered_with_legacy(&layers, legacy_url.as_deref());
+    // The legacy file only counted when no layer supplied a URL itself.
+    let imported_legacy = legacy_url
+        .filter(|url| effective.portal_url.as_deref() == Some(url.as_str()))
+        .and_then(|_| source.legacy_path.clone());
+    Ok(Loaded {
+        effective,
+        files,
+        imported_legacy,
+    })
+}
+
+/// Check that the effective settings can actually be used.
+///
+/// `require_identity` is what the unattended paths ask for: without a portal URL
+/// and an account there is nothing to authenticate as, and failing here is
+/// better than a task that reports an anonymous error every interval. Values
+/// whose range is bounded are checked even when the identity is not required, so
+/// `config validate` catches a timeout of zero before a run does.
+pub fn validate(effective: &Effective, require_identity: bool) -> Result<(), ConfigError> {
+    if let Some(slug) = effective.portal_url.as_deref() {
+        let portal = config::parse_portal_url(slug)
+            .map_err(|err| ConfigError::Invalid(format!("portal_url: {err}")))?;
+        if !(portal.origin.starts_with("http://") || portal.origin.starts_with("https://")) {
+            return Err(ConfigError::Invalid(format!(
+                "portal_url: {} is not an http or https URL",
+                portal.origin
+            )));
+        }
     }
-    if let Some(file) = portable.as_ref() {
-        layers.push(&file.settings);
+    if let Some(username) = effective.username.as_deref() {
+        if username.trim().is_empty() {
+            return Err(ConfigError::Invalid(
+                "username must not be empty".to_string(),
+            ));
+        }
     }
-    let legacy_url = read_legacy_url(paths);
-    Ok(layered_with_legacy(&layers, legacy_url.as_deref()))
+    for (name, value) in [
+        ("timeout_ms", effective.timeouts.connect_ms),
+        ("timeout_ms", effective.timeouts.read_ms),
+    ] {
+        if !(1..=MAX_TIMEOUT_MS).contains(&value) {
+            return Err(ConfigError::Invalid(format!(
+                "{name} must be between 1 and {MAX_TIMEOUT_MS} (got {value})"
+            )));
+        }
+    }
+    if let Some(secs) = effective.reconnect_interval_secs {
+        if secs > MAX_INTERVAL_SECS {
+            return Err(ConfigError::Invalid(format!(
+                "reconnect_interval_secs must be at most {MAX_INTERVAL_SECS} (got {secs})"
+            )));
+        }
+    }
+    if let Some(secs) = effective.reconnect_boot_delay_secs {
+        if secs > MAX_BOOT_DELAY_SECS {
+            return Err(ConfigError::Invalid(format!(
+                "reconnect_boot_delay_secs must be at most {MAX_BOOT_DELAY_SECS} (got {secs})"
+            )));
+        }
+    }
+    if require_identity {
+        if effective.portal_url.is_none() {
+            return Err(ConfigError::Invalid(
+                crate::messages::PORTAL_URL_REQUIRED.to_string(),
+            ));
+        }
+        if effective.username.is_none() {
+            return Err(ConfigError::Invalid(
+                "username is required for an unattended reconnect".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The effective settings plus the ability to change the write target.
+///
+/// Every mutation re-reads the layers **inside** the file's cross-process lock,
+/// re-migrates legacy keys against the effective values, merges the requested
+/// change and only then replaces the file. A failed write leaves both the file
+/// and this value as they were.
+#[derive(Debug, Clone)]
+pub struct Resolution {
+    source: ConfigSource,
+    effective: Effective,
+}
+
+impl Resolution {
+    /// Load `source` without creating anything.
+    pub fn open(source: ConfigSource) -> Result<Resolution, ConfigError> {
+        let loaded = load_source(&source)?;
+        Ok(Resolution {
+            source,
+            effective: loaded.effective,
+        })
+    }
+
+    pub fn source(&self) -> &ConfigSource {
+        &self.source
+    }
+
+    pub fn effective(&self) -> &Effective {
+        &self.effective
+    }
+
+    /// The write target's contents as `config list` shows them; empty when the
+    /// file does not exist yet.
+    pub fn entries(&self) -> Result<Vec<(&'static str, String)>, ConfigError> {
+        Ok(ConfigFile::read(&self.source.write_path)?
+            .map(|file| file.entries())
+            .unwrap_or_default())
+    }
+
+    /// The file that supplies `key` in the effective settings: the highest layer
+    /// that sets it, or the legacy file for a portal URL it alone provides.
+    pub fn value_source(&self, key: &str) -> Result<Option<PathBuf>, ConfigError> {
+        let loaded = load_source(&self.source)?;
+        let mut found = None;
+        for file in &loaded.files {
+            if file.entries().iter().any(|(name, _)| *name == key) {
+                found = Some(file.path.clone());
+            }
+        }
+        if found.is_none() && key == "portal_url" && loaded.imported_legacy.is_some() {
+            found = loaded.imported_legacy;
+        }
+        Ok(found)
+    }
+
+    /// Merge `changes` into the write target, creating it when it is missing.
+    pub fn update(&mut self, changes: &[(&str, Value)]) -> Result<bool, ConfigError> {
+        let _lock = self.lock()?;
+        let snapshot = load_source(&self.source)?.effective;
+        let mut file = match ConfigFile::read(&self.source.write_path)? {
+            Some(file) => file,
+            None => ConfigFile::fresh(&self.source.write_path, &Settings::documented_defaults()),
+        };
+        let written = file.update(changes, &snapshot)?;
+        self.refresh()?;
+        Ok(written)
+    }
+
+    /// Remove `keys` from the write target, revealing lower layers or defaults.
+    pub fn remove(&mut self, keys: &[&str]) -> Result<RemoveOutcome, ConfigError> {
+        let _lock = self.lock()?;
+        let snapshot = load_source(&self.source)?.effective;
+        let Some(mut file) = ConfigFile::read(&self.source.write_path)? else {
+            // Nothing on disk: nothing was set and nothing is written.
+            let removed = keys
+                .iter()
+                .map(|key| {
+                    KEY_CATALOGUE.iter().any(|entry| entry.name == *key)
+                        && snapshot_has(&snapshot, key)
+                })
+                .collect();
+            return Ok(RemoveOutcome {
+                removed,
+                written: false,
+            });
+        };
+        let outcome = file.remove(keys, &snapshot)?;
+        self.refresh()?;
+        Ok(outcome)
+    }
+
+    fn lock(&self) -> Result<FileLock, ConfigError> {
+        FileLock::acquire(&self.source.write_path)
+            .map_err(|err| ConfigError::Io(format!("{}: {err}", self.source.write_path.display())))
+    }
+
+    fn refresh(&mut self) -> Result<(), ConfigError> {
+        self.effective = load_source(&self.source)?.effective;
+        Ok(())
+    }
+}
+
+/// Whether the effective settings carry a value for `key`, used when the write
+/// target does not exist and only the answer matters.
+fn snapshot_has(effective: &Effective, key: &str) -> bool {
+    match key {
+        "portal_url" => effective.portal_url.is_some(),
+        "username" => effective.username.is_some(),
+        "reconnect_interval_secs" => effective.reconnect_interval_secs.is_some(),
+        "reconnect_boot_delay_secs" => effective.reconnect_boot_delay_secs.is_some(),
+        // The timeout keys always have a value (the default applies).
+        _ => true,
+    }
 }
 
 /// The legacy file's portal URL, or `None` when there is no legacy file, it is
 /// incomplete, or it cannot be read. A broken legacy file must not stop the CLI
 /// from starting, so the failure is reported and then ignored.
-fn read_legacy_url(paths: &Paths) -> Option<String> {
-    let legacy = paths.legacy.as_deref()?;
+fn read_legacy_url(legacy: Option<&Path>) -> Option<String> {
+    let legacy = legacy?;
     match config::read_legacy_from(legacy) {
         Ok(Some(env)) => config::url_from_env(&env),
         Ok(None) => None,
@@ -779,19 +924,20 @@ fn read_legacy_url(paths: &Paths) -> Option<String> {
 /// Ask where a first-run configuration file should go.
 ///
 /// Without a terminal there is nobody to ask, so the system location is chosen
-/// silently — a scripted first run stays non-interactive.
-pub fn ask_storage(paths: &Paths) -> Storage {
+/// silently — a scripted first run stays non-interactive. Only the three
+/// initialising commands call this, and only when no layer exists.
+pub fn ask_storage(system: &Path, portable: &Path) -> Storage {
     if !sys::stdin_is_tty() {
         return Storage::System;
     }
     eprintln!("No configuration file found.");
     eprintln!(
         "  1) Portable - next to the executable: {}",
-        paths.portable.display()
+        portable.display()
     );
     eprintln!(
         "  2) System   - per this system's conventions: {}",
-        paths.system.display()
+        system.display()
     );
     loop {
         match sys::prompt_line("Store the configuration where? [2]: ") {
@@ -807,6 +953,15 @@ pub fn ask_storage(paths: &Paths) -> Storage {
             }
         }
     }
+}
+
+/// Point a source that has no file anywhere at the location the user chose.
+pub fn choose_first_run(source: &mut ConfigSource, storage: Storage) {
+    let (system, portable) = source.locations();
+    source.write_path = match storage {
+        Storage::Portable => portable,
+        Storage::System => system,
+    };
 }
 
 #[cfg(test)]
@@ -848,36 +1003,25 @@ mod tests {
         }
     }
 
-    /// The three locations, all inside one scratch directory. No file exists
-    /// until a test writes one.
-    fn scratch_paths(dir: &TempDir) -> Paths {
-        Paths {
-            system: dir.path().join("etc").join(CONFIG_FILE_NAME),
-            portable: dir.path().join("bin").join(CONFIG_FILE_NAME),
-            legacy: Some(dir.path().join(".srun_portal.json")),
-        }
-    }
-
     fn write(path: &Path, body: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, body).unwrap();
-    }
-
-    fn never_asked(_: &Paths) -> Storage {
-        panic!("no question expected: a configuration file exists")
     }
 
     fn url(host: &str) -> String {
         format!("https://{host}/srun_portal_pc?ac_id=1")
     }
 
-    fn explicit_resolution(path: &Path) -> Resolution {
-        let paths = Paths {
-            system: path.with_extension("system.toml"),
-            portable: path.with_extension("portable.toml"),
-            legacy: None,
-        };
-        resolve(&paths, Some(path), None, &mut never_asked).unwrap()
+    /// A two-layer source: a system file and a portable file.
+    fn layered_source(dir: &TempDir) -> ConfigSource {
+        ConfigSource {
+            layers: vec![
+                dir.path().join("etc").join(CONFIG_FILE_NAME),
+                dir.path().join("bin").join(CONFIG_FILE_NAME),
+            ],
+            write_path: dir.path().join("bin").join(CONFIG_FILE_NAME),
+            legacy_path: None,
+        }
     }
 
     #[test]
@@ -889,15 +1033,9 @@ mod tests {
             "portal_url = \"https://a/srun_portal_pc?ac_id=1\"\nextra = 1\n",
         );
 
-        let mut resolution = explicit_resolution(&path);
+        let mut resolution = Resolution::open(ConfigSource::single(&path)).unwrap();
         assert_eq!(
-            resolution
-                .base
-                .as_ref()
-                .unwrap()
-                .settings
-                .portal_url
-                .as_deref(),
+            resolution.effective().portal_url.as_deref(),
             Some(&url("a")[..])
         );
 
@@ -926,17 +1064,14 @@ mod tests {
              read_timeout_ms = 12000\n",
         );
 
-        let mut resolution = explicit_resolution(&path);
-        let effective = resolution.effective.clone();
-        assert_eq!(effective.domain.as_deref(), Some("szu"));
-        assert_eq!(effective.callback, "cb");
-        assert_eq!(effective.timeouts.connect_ms, 5000);
-        assert_eq!(effective.timeouts.read_ms, 12000);
+        let mut resolution = Resolution::open(ConfigSource::single(&path)).unwrap();
+        assert_eq!(resolution.effective().domain.as_deref(), Some("szu"));
+        assert_eq!(resolution.effective().callback, "cb");
+        assert_eq!(resolution.effective().timeouts.connect_ms, 5000);
+        assert_eq!(resolution.effective().timeouts.read_ms, 12000);
         let names: Vec<&str> = resolution
-            .base
-            .as_ref()
-            .unwrap()
             .entries()
+            .unwrap()
             .into_iter()
             .map(|(name, _)| name)
             .collect();
@@ -975,7 +1110,7 @@ mod tests {
             let dir = TempDir::new(tag);
             let path = dir.path().join(CONFIG_FILE_NAME);
             write(&path, body);
-            let mut resolution = explicit_resolution(&path);
+            let mut resolution = Resolution::open(ConfigSource::single(&path)).unwrap();
 
             resolution
                 .update(&[("username", Value::String("alice".to_string()))])
@@ -983,8 +1118,8 @@ mod tests {
 
             let file = ConfigFile::read(&path).unwrap().unwrap();
             assert_eq!(file.settings.timeout_ms, Some(expected));
-            assert_eq!(resolution.effective.timeouts.connect_ms, expected);
-            assert_eq!(resolution.effective.timeouts.read_ms, expected);
+            assert_eq!(resolution.effective().timeouts.connect_ms, expected);
+            assert_eq!(resolution.effective().timeouts.read_ms, expected);
             let text = std::fs::read_to_string(path).unwrap();
             assert!(!text.contains("connect_timeout_ms"));
             assert!(!text.contains("read_timeout_ms"));
@@ -998,24 +1133,24 @@ mod tests {
             ("lower-current", "timeout_ms = 15000\n", 15_000),
         ] {
             let dir = TempDir::new(tag);
-            let paths = scratch_paths(&dir);
-            write(&paths.system, system_body);
-            write(&paths.portable, "connect_timeout_ms = 5000\n");
-            let system_before = std::fs::read_to_string(&paths.system).unwrap();
-            let mut resolution = resolve(&paths, None, None, &mut never_asked).unwrap();
+            let source = layered_source(&dir);
+            write(&source.layers[0], system_body);
+            write(&source.layers[1], "connect_timeout_ms = 5000\n");
+            let system_before = std::fs::read_to_string(&source.layers[0]).unwrap();
+            let mut resolution = Resolution::open(source.clone()).unwrap();
 
             resolution
                 .update(&[("username", Value::String("alice".to_string()))])
                 .unwrap();
 
             assert_eq!(
-                std::fs::read_to_string(&paths.system).unwrap(),
+                std::fs::read_to_string(&source.layers[0]).unwrap(),
                 system_before
             );
-            let portable = ConfigFile::read(&paths.portable).unwrap().unwrap();
+            let portable = ConfigFile::read(&source.write_path).unwrap().unwrap();
             assert_eq!(portable.settings.timeout_ms, Some(expected));
-            assert_eq!(resolution.effective.timeouts.connect_ms, expected);
-            assert_eq!(resolution.effective.timeouts.read_ms, expected);
+            assert_eq!(resolution.effective().timeouts.connect_ms, expected);
+            assert_eq!(resolution.effective().timeouts.read_ms, expected);
         }
     }
 
@@ -1027,7 +1162,7 @@ mod tests {
             &path,
             "connect_timeout_ms = 5000\nread_timeout_ms = 12000\n",
         );
-        let mut resolution = explicit_resolution(&path);
+        let mut resolution = Resolution::open(ConfigSource::single(&path)).unwrap();
         resolution
             .update(&[("timeout_ms", Value::Integer(7000))])
             .unwrap();
@@ -1040,51 +1175,38 @@ mod tests {
             &path,
             "timeout_ms = 9000\nconnect_timeout_ms = 5000\nread_timeout_ms = 12000\n",
         );
-        let mut resolution = explicit_resolution(&path);
-        resolution.remove(&["timeout_ms"]).unwrap();
+        let mut resolution = Resolution::open(ConfigSource::single(&path)).unwrap();
+        let outcome = resolution.remove(&["timeout_ms"]).unwrap();
+        assert_eq!(outcome.removed, [true]);
+        assert!(outcome.written);
         let file = ConfigFile::read(&path).unwrap().unwrap();
         assert_eq!(file.settings.timeout_ms, None);
         assert_eq!(file.settings.legacy_connect_timeout_ms, None);
         assert_eq!(file.settings.legacy_read_timeout_ms, None);
-        assert_eq!(resolution.effective.timeouts, Effective::default().timeouts);
+        assert_eq!(
+            resolution.effective().timeouts,
+            Effective::default().timeouts
+        );
     }
 
     #[test]
     fn layered_timeout_unset_reveals_lower_current_value() {
         let dir = TempDir::new("layered-timeout-unset");
-        let paths = scratch_paths(&dir);
-        write(&paths.system, "timeout_ms = 15000\n");
+        let source = layered_source(&dir);
+        write(&source.layers[0], "timeout_ms = 15000\n");
         write(
-            &paths.portable,
+            &source.layers[1],
             "timeout_ms = 9000\nconnect_timeout_ms = 5000\n",
         );
-        let mut resolution = resolve(&paths, None, None, &mut never_asked).unwrap();
+        let mut resolution = Resolution::open(source.clone()).unwrap();
 
         resolution.remove(&["timeout_ms"]).unwrap();
 
-        let portable = ConfigFile::read(&paths.portable).unwrap().unwrap();
+        let portable = ConfigFile::read(&source.write_path).unwrap().unwrap();
         assert_eq!(portable.settings.timeout_ms, None);
         assert_eq!(portable.settings.legacy_connect_timeout_ms, None);
-        assert_eq!(resolution.effective.timeouts.connect_ms, 15_000);
-        assert_eq!(resolution.effective.timeouts.read_ms, 15_000);
-    }
-
-    #[test]
-    fn current_timeout_survives_unrelated_write_while_legacy_timeout_is_removed() {
-        let dir = TempDir::new("current-and-legacy-timeout");
-        let path = dir.path().join(CONFIG_FILE_NAME);
-        write(&path, "timeout_ms = 9000\nconnect_timeout_ms = 5000\n");
-        let mut resolution = explicit_resolution(&path);
-
-        resolution
-            .update(&[("username", Value::String("alice".to_string()))])
-            .unwrap();
-
-        let file = ConfigFile::read(&path).unwrap().unwrap();
-        assert_eq!(file.settings.timeout_ms, Some(9000));
-        assert_eq!(file.settings.legacy_connect_timeout_ms, None);
-        assert_eq!(resolution.effective.timeouts.connect_ms, 9000);
-        assert_eq!(resolution.effective.timeouts.read_ms, 9000);
+        assert_eq!(resolution.effective().timeouts.connect_ms, 15_000);
+        assert_eq!(resolution.effective().timeouts.read_ms, 15_000);
     }
 
     #[test]
@@ -1101,7 +1223,7 @@ mod tests {
                 &path,
                 &format!("username = \"{username}\"\ndomain = \"{domain}\"\n"),
             );
-            let mut resolution = explicit_resolution(&path);
+            let mut resolution = Resolution::open(ConfigSource::single(&path)).unwrap();
 
             resolution
                 .update(&[("portal_url", Value::String(url("portal")))])
@@ -1110,63 +1232,37 @@ mod tests {
             let file = ConfigFile::read(&path).unwrap().unwrap();
             assert_eq!(file.settings.username.as_deref(), Some(expected));
             assert_eq!(file.settings.legacy_domain, None);
-            assert_eq!(resolution.effective.username.as_deref(), Some(expected));
-            assert_eq!(resolution.effective.domain, None);
+            assert_eq!(resolution.effective().username.as_deref(), Some(expected));
+            assert_eq!(resolution.effective().domain, None);
         }
     }
 
     #[test]
     fn domain_migration_uses_lower_username_or_waits_without_one() {
         let dir = TempDir::new("layered-domain");
-        let paths = scratch_paths(&dir);
-        write(&paths.system, "username = \"alice\"\n");
-        write(&paths.portable, "domain = \"szu\"\n");
-        let mut resolution = resolve(&paths, None, None, &mut never_asked).unwrap();
+        let source = layered_source(&dir);
+        write(&source.layers[0], "username = \"alice\"\n");
+        write(&source.layers[1], "domain = \"szu\"\n");
+        let mut resolution = Resolution::open(source.clone()).unwrap();
 
         resolution
             .update(&[("portal_url", Value::String(url("portal")))])
             .unwrap();
 
-        let portable = ConfigFile::read(&paths.portable).unwrap().unwrap();
+        let portable = ConfigFile::read(&source.write_path).unwrap().unwrap();
         assert_eq!(portable.settings.username.as_deref(), Some("alice@szu"));
         assert_eq!(portable.settings.legacy_domain, None);
-        assert_eq!(resolution.effective.username.as_deref(), Some("alice@szu"));
-
-        let delayed = dir.path().join("delayed.toml");
-        write(&delayed, "domain = \"szu\"\n");
-        let mut resolution = explicit_resolution(&delayed);
-        resolution
-            .update(&[("portal_url", Value::String(url("portal")))])
-            .unwrap();
-        let file = ConfigFile::read(&delayed).unwrap().unwrap();
-        assert_eq!(file.settings.username, None);
-        assert_eq!(file.settings.legacy_domain.as_deref(), Some("szu"));
-    }
-
-    #[test]
-    fn callback_removal_refreshes_effective_state_immediately() {
-        let dir = TempDir::new("callback-refresh");
-        let path = dir.path().join(CONFIG_FILE_NAME);
-        write(&path, "callback = \"legacy\"\n");
-        let mut resolution = explicit_resolution(&path);
-        assert_eq!(resolution.effective.callback, "legacy");
-
-        resolution
-            .update(&[("username", Value::String("alice".to_string()))])
-            .unwrap();
-
-        assert_eq!(resolution.effective.callback, crate::api::DEFAULT_CALLBACK);
-        assert!(!std::fs::read_to_string(path)
-            .unwrap()
-            .contains("callback ="));
+        assert_eq!(
+            resolution.effective().username.as_deref(),
+            Some("alice@szu")
+        );
     }
 
     #[test]
     fn update_writes_only_on_change() {
         let dir = TempDir::new("nochange");
         let path = dir.path().join(CONFIG_FILE_NAME);
-        ConfigFile::create(&path, &Settings::default()).unwrap();
-        let mut resolution = explicit_resolution(&path);
+        let mut resolution = Resolution::open(ConfigSource::single(&path)).unwrap();
 
         assert!(resolution
             .update(&[("portal_url", Value::String(url("a")))])
@@ -1181,244 +1277,306 @@ mod tests {
     #[test]
     fn portable_overrides_system_per_key() {
         let dir = TempDir::new("layers");
-        let paths = scratch_paths(&dir);
+        let source = layered_source(&dir);
         write(
-            &paths.system,
+            &source.layers[0],
             "callback = \"b\"\nconnect_timeout_ms = 100\nreconnect_interval_secs = 600\n",
         );
-        write(&paths.portable, "portal_url = \"https://p/srun_portal_pc?ac_id=1\"\ncallback = \"p\"\nreconnect_interval_secs = 60\n");
-
-        let resolution = resolve(&paths, None, None, &mut never_asked).unwrap();
-
-        assert_eq!(resolution.effective.callback, "p");
-        assert_eq!(
-            resolution.effective.portal_url.as_deref(),
-            Some(&url("p")[..])
+        write(
+            &source.layers[1],
+            "portal_url = \"https://p/srun_portal_pc?ac_id=1\"\n",
         );
-        // The project file still overrides the system one, key by key.
-        assert_eq!(resolution.effective.reconnect_interval_secs, Some(60));
+
+        let effective = load_source(&source).unwrap().effective;
+
+        // `callback` is a legacy key, so the lower layer still supplies it.
+        assert_eq!(effective.callback, "b");
+        assert_eq!(effective.portal_url.as_deref(), Some(&url("p")[..]));
         // The system file still supplies what the project file does not set.
-        assert_eq!(resolution.effective.timeouts.connect_ms, 100);
-        assert_eq!(resolution.effective.timeouts.read_ms, DEFAULT_TIMEOUT_MS);
-        // Neither file sets this one, so the documented default applies.
-        assert_eq!(resolution.effective.reconnect_boot_delay_secs, Some(30));
-    }
-
-    #[test]
-    fn explicit_config_ignores_the_layering() {
-        let dir = TempDir::new("explicit");
-        let paths = scratch_paths(&dir);
-        write(&paths.system, "callback = \"b\"\n");
-        write(&paths.portable, "callback = \"p\"\n");
-        let explicit = dir.path().join("chosen.toml");
-        write(&explicit, "username = \"explicit\"\n");
-
-        let resolution = resolve(&paths, Some(&explicit), None, &mut never_asked).unwrap();
-
-        assert_eq!(resolution.base_path.as_deref(), Some(explicit.as_path()));
-        assert_eq!(resolution.effective.username.as_deref(), Some("explicit"));
-        assert_eq!(resolution.effective.callback, crate::api::DEFAULT_CALLBACK);
-        assert!(!resolution.created);
-
-        // A missing explicit path is created, seeded with nothing.
-        let missing = dir.path().join("nested/new.toml");
-        let resolution = resolve(&paths, Some(&missing), None, &mut never_asked).unwrap();
-        assert!(resolution.created);
-        assert_eq!(resolution.base_path.as_deref(), Some(missing.as_path()));
-        assert!(missing.exists());
-    }
-
-    #[test]
-    fn portable_wins_over_system() {
-        let dir = TempDir::new("portable-wins");
-        let paths = scratch_paths(&dir);
-        write(
-            &paths.system,
-            "portal_url = \"https://system/srun_portal_pc?ac_id=1\"\n",
-        );
-        write(
-            &paths.portable,
-            "portal_url = \"https://portable/srun_portal_pc?ac_id=1\"\n",
-        );
-
-        let resolution = resolve(&paths, None, None, &mut never_asked).unwrap();
-
-        assert_eq!(
-            resolution.base_path.as_deref(),
-            Some(paths.portable.as_path())
-        );
-        assert_eq!(
-            resolution.effective.portal_url.as_deref(),
-            Some(&url("portable")[..])
-        );
-        assert!(!resolution.created);
-    }
-
-    #[test]
-    fn first_run_creates_the_chosen_location() {
-        let dir = TempDir::new("first-run");
-        let paths = scratch_paths(&dir);
-
-        let mut choose_portable = |_: &Paths| Storage::Portable;
-        let resolution = resolve(&paths, None, None, &mut choose_portable).unwrap();
-        assert!(resolution.created);
-        assert_eq!(
-            resolution.base_path.as_deref(),
-            Some(paths.portable.as_path())
-        );
-        assert!(paths.portable.exists());
-        assert!(!paths.system.exists());
-
-        let dir = TempDir::new("first-run-system");
-        let paths = scratch_paths(&dir);
-        let mut choose_system = |_: &Paths| Storage::System;
-        let resolution = resolve(&paths, None, None, &mut choose_system).unwrap();
-        assert!(resolution.created);
-        assert_eq!(
-            resolution.base_path.as_deref(),
-            Some(paths.system.as_path())
-        );
-        assert!(paths.system.exists());
-        assert!(!paths.portable.exists());
-
-        // `--portable` answers the question without asking.
-        let dir = TempDir::new("first-run-forced");
-        let paths = scratch_paths(&dir);
-        let resolution = resolve(&paths, None, Some(Storage::Portable), &mut never_asked).unwrap();
-        assert!(resolution.created);
-        assert_eq!(
-            resolution.base_path.as_deref(),
-            Some(paths.portable.as_path())
-        );
-    }
-
-    #[test]
-    fn non_tty_first_run_defaults_to_system() {
-        if sys::stdin_is_tty() {
-            return; // the question would block on a terminal
-        }
-        let dir = TempDir::new("non-tty");
-        assert_eq!(ask_storage(&scratch_paths(&dir)), Storage::System);
-    }
-
-    #[test]
-    fn legacy_seeds_created_config() {
-        let dir = TempDir::new("legacy-seed");
-        let paths = scratch_paths(&dir);
-        write(
-            paths.legacy.as_ref().unwrap(),
-            r#"{"authURL":"https://net.szu.edu.cn","acid":"1"}"#,
-        );
-
-        let mut choose_system = |_: &Paths| Storage::System;
-        let resolution = resolve(&paths, None, None, &mut choose_system).unwrap();
-
-        assert_eq!(
-            resolution.imported_legacy.as_deref(),
-            paths.legacy.as_deref()
-        );
-        assert_eq!(
-            resolution.effective.portal_url.as_deref(),
-            Some("https://net.szu.edu.cn/srun_portal_pc?ac_id=1")
-        );
-        let created = std::fs::read_to_string(&paths.system).unwrap();
-        assert!(
-            created.contains("portal_url = \"https://net.szu.edu.cn/srun_portal_pc?ac_id=1\""),
-            "{created}"
-        );
-        // The legacy file itself is left alone.
-        assert!(std::fs::read_to_string(paths.legacy.as_ref().unwrap())
-            .unwrap()
-            .contains("\"acid\":\"1\""));
-    }
-
-    #[test]
-    fn legacy_is_only_a_fallback() {
-        let dir = TempDir::new("legacy-fallback");
-        let paths = scratch_paths(&dir);
-        write(
-            &paths.system,
-            &format!("portal_url = \"{}\"\n", url("configured")),
-        );
-        write(
-            paths.legacy.as_ref().unwrap(),
-            r#"{"authURL":"https://legacy","acid":"9"}"#,
-        );
-        let before = std::fs::read_to_string(&paths.system).unwrap();
-
-        let resolution = resolve(&paths, None, None, &mut never_asked).unwrap();
-
-        assert_eq!(
-            resolution.effective.portal_url.as_deref(),
-            Some(&url("configured")[..])
-        );
-        assert_eq!(resolution.imported_legacy, None);
-        assert_eq!(std::fs::read_to_string(&paths.system).unwrap(), before);
-
-        // A configuration without a URL still falls back to the legacy one.
-        write(&paths.system, "username = \"someone\"\n");
-        let resolution = resolve(&paths, None, None, &mut never_asked).unwrap();
-        assert_eq!(
-            resolution.effective.portal_url.as_deref(),
-            Some("https://legacy/srun_portal_pc?ac_id=9")
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn unwritable_portable_falls_back_to_system() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = TempDir::new("read-only");
-        let paths = scratch_paths(&dir);
-        let portable_dir = paths.portable.parent().unwrap().to_path_buf();
-        std::fs::create_dir_all(&portable_dir).unwrap();
-        std::fs::set_permissions(&portable_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
-        if unsafe { libc::geteuid() } == 0 {
-            return; // root writes anywhere, so there is nothing to test
-        }
-
-        let resolution = resolve(&paths, None, Some(Storage::Portable), &mut never_asked).unwrap();
-
-        assert_eq!(
-            resolution.base_path.as_deref(),
-            Some(paths.system.as_path())
-        );
-        assert!(paths.system.exists());
-        assert!(!paths.portable.exists());
-
-        std::fs::set_permissions(&portable_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-    }
-
-    #[test]
-    fn defaults_match_the_documentation() {
-        let dir = TempDir::new("defaults");
-        let paths = scratch_paths(&dir);
-        write(&paths.system, "# nothing but a comment\nextra = \"kept\"\n");
-
-        let effective = load_existing(&paths, None).unwrap();
-
-        assert_eq!(effective, Effective::default());
-        assert_eq!(effective.callback, "jsonp");
-        assert_eq!(
-            effective.timeouts,
-            Timeouts {
-                connect_ms: DEFAULT_TIMEOUT_MS,
-                read_ms: DEFAULT_TIMEOUT_MS,
-            }
-        );
-        assert_eq!(effective.portal_url, None);
-        // The background task is on by default: installing one that never runs
-        // would be pointless. `0` is how a file switches either half off.
-        assert_eq!(effective.reconnect_interval_secs, Some(300));
+        assert_eq!(effective.timeouts.connect_ms, 100);
+        assert_eq!(effective.timeouts.read_ms, DEFAULT_TIMEOUT_MS);
+        // The project file does not set this one, so the lower layer wins.
+        assert_eq!(effective.reconnect_interval_secs, Some(600));
         assert_eq!(effective.reconnect_boot_delay_secs, Some(30));
     }
 
     #[test]
+    fn identical_and_hard_linked_layers_are_read_once() {
+        let dir = TempDir::new("identical-paths");
+        let path = dir.path().join(CONFIG_FILE_NAME);
+        write(&path, &format!("portal_url = {:?}\n", url("shared")));
+        let source = ConfigSource {
+            layers: vec![path.clone(), path.clone()],
+            write_path: path.clone(),
+            legacy_path: None,
+        };
+        assert_eq!(load_source(&source).unwrap().files.len(), 1);
+
+        let dir = TempDir::new("hard-linked-paths");
+        let source = layered_source(&dir);
+        write(
+            &source.layers[0],
+            &format!("portal_url = {:?}\n", url("linked")),
+        );
+        std::fs::create_dir_all(source.layers[1].parent().unwrap()).unwrap();
+        std::fs::hard_link(&source.layers[0], &source.layers[1]).unwrap();
+        let loaded = load_source(&source).unwrap();
+        assert_eq!(loaded.files.len(), 1);
+        assert_eq!(
+            loaded.effective.portal_url.as_deref(),
+            Some(&url("linked")[..])
+        );
+    }
+
+    #[test]
+    fn a_missing_configuration_is_defaults_not_a_new_file() {
+        let dir = TempDir::new("missing");
+        let source = layered_source(&dir);
+
+        let loaded = load_source(&source).unwrap();
+        assert_eq!(loaded.effective, Effective::default());
+        assert!(!source.layers[0].exists());
+        assert!(!source.layers[1].exists());
+        assert!(!source.exists().unwrap());
+
+        // Reading is not initialising: nothing was created.
+        let resolution = Resolution::open(source.clone()).unwrap();
+        assert!(resolution.entries().unwrap().is_empty());
+        assert!(!source.layers[0].exists());
+        assert!(!source.layers[1].exists());
+    }
+
+    #[test]
+    fn validate_rejects_unusable_values() {
+        let base = Effective::default();
+        assert!(validate(&base, false).is_ok());
+
+        let mut bad = base.clone();
+        bad.portal_url = Some("not-a-url".to_string());
+        assert!(validate(&bad, false).is_err());
+
+        let mut bad = base.clone();
+        bad.portal_url = Some("ftp://host/srun_portal_pc?ac_id=1".to_string());
+        assert!(validate(&bad, false).is_err(), "scheme must be http(s)");
+
+        let mut bad = base.clone();
+        bad.username = Some("   ".to_string());
+        assert!(validate(&bad, false).is_err());
+
+        let mut bad = base.clone();
+        bad.timeouts.connect_ms = 0;
+        assert!(validate(&bad, false).is_err());
+        bad.timeouts.connect_ms = MAX_TIMEOUT_MS + 1;
+        assert!(validate(&bad, false).is_err());
+
+        let mut bad = base.clone();
+        bad.reconnect_interval_secs = Some(MAX_INTERVAL_SECS + 1);
+        assert!(validate(&bad, false).is_err());
+        bad.reconnect_interval_secs = Some(MAX_INTERVAL_SECS);
+        assert!(validate(&bad, false).is_ok());
+
+        let mut bad = base.clone();
+        bad.reconnect_boot_delay_secs = Some(MAX_BOOT_DELAY_SECS + 1);
+        assert!(validate(&bad, false).is_err());
+
+        // Identity is only required when asked for.
+        assert!(validate(&base, true).is_err());
+        let mut complete = base.clone();
+        complete.portal_url = Some(url("portal"));
+        complete.username = Some("alice".to_string());
+        assert!(validate(&complete, true).is_ok());
+    }
+
+    #[test]
+    fn a_bad_legacy_value_is_reported_with_path_and_key() {
+        let dir = TempDir::new("bad-value");
+        let source = layered_source(&dir);
+        write(&source.layers[0], "connect_timeout_ms = \"x\"\n");
+
+        let err = load_source(&source).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("connect_timeout_ms"), "{message}");
+        assert!(
+            message.contains(&source.layers[0].display().to_string()),
+            "{message}"
+        );
+
+        write(&source.layers[0], "reconnect_interval_secs = \"often\"\n");
+        let message = load_source(&source).unwrap_err().to_string();
+        assert!(message.contains("reconnect_interval_secs"), "{message}");
+    }
+
+    #[test]
+    fn legacy_seeds_the_effective_url_without_writing() {
+        let dir = TempDir::new("legacy-seed");
+        let mut source = layered_source(&dir);
+        let legacy = dir.path().join(".srun_portal.json");
+        write(
+            &legacy,
+            r#"{"authURL":"https://net.szu.edu.cn","acid":"1"}"#,
+        );
+        source.legacy_path = Some(legacy.clone());
+
+        let loaded = load_source(&source).unwrap();
+        assert_eq!(
+            loaded.effective.portal_url.as_deref(),
+            Some("https://net.szu.edu.cn/srun_portal_pc?ac_id=1")
+        );
+        assert_eq!(loaded.imported_legacy.as_deref(), Some(legacy.as_path()));
+        assert!(!source.layers[0].exists());
+        assert!(!source.layers[1].exists());
+
+        // A layer that sets the URL wins over the legacy file.
+        write(
+            &source.layers[0],
+            &format!("portal_url = \"{}\"\n", url("configured")),
+        );
+        let loaded = load_source(&source).unwrap();
+        assert_eq!(
+            loaded.effective.portal_url.as_deref(),
+            Some(&url("configured")[..])
+        );
+        assert_eq!(loaded.imported_legacy, None);
+    }
+
+    #[test]
+    fn concurrent_updates_to_different_keys_both_land() {
+        let dir = TempDir::new("concurrent");
+        let path = dir.path().join(CONFIG_FILE_NAME);
+        write(&path, "username = \"alice\"\n");
+
+        // Two resolutions read the same snapshot, as two processes would…
+        let mut first = Resolution::open(ConfigSource::single(&path)).unwrap();
+        let mut second = Resolution::open(ConfigSource::single(&path)).unwrap();
+        assert_eq!(first.effective().username.as_deref(), Some("alice"));
+        assert_eq!(second.effective().username.as_deref(), Some("alice"));
+
+        // …and each writes its own key. The lock makes the second re-read, so
+        // the first one's key is still there afterwards.
+        first
+            .update(&[("timeout_ms", Value::Integer(20_000))])
+            .unwrap();
+        second
+            .update(&[("reconnect_interval_secs", Value::Integer(600))])
+            .unwrap();
+
+        let file = ConfigFile::read(&path).unwrap().unwrap();
+        assert_eq!(file.settings.timeout_ms, Some(20_000));
+        assert_eq!(file.settings.reconnect_interval_secs, Some(600));
+        assert_eq!(file.settings.username.as_deref(), Some("alice"));
+        assert_eq!(second.effective().timeouts.read_ms, 20_000);
+    }
+
+    #[test]
+    fn a_failed_write_leaves_the_old_file_parseable() {
+        let dir = TempDir::new("write-failure");
+        let path = dir.path().join(CONFIG_FILE_NAME);
+        write(&path, &format!("portal_url = {:?}\n", url("kept")));
+
+        // A negative integer is rejected while re-parsing the merged table, so
+        // the write never starts and the old bytes stay as they were.
+        let mut resolution = Resolution::open(ConfigSource::single(&path)).unwrap();
+        assert!(resolution
+            .update(&[("timeout_ms", Value::Integer(-5))])
+            .is_err());
+        let reread = ConfigFile::read(&path).unwrap().unwrap();
+        assert_eq!(
+            reread.settings.portal_url.as_deref(),
+            Some(&url("kept")[..])
+        );
+        assert_eq!(reread.settings.timeout_ms, None);
+    }
+
+    #[test]
+    fn unset_reports_each_key_and_prunes_only_known_keys() {
+        let dir = TempDir::new("set-unset");
+        let path = dir.path().join(CONFIG_FILE_NAME);
+        let mut resolution = Resolution::open(ConfigSource::single(&path)).unwrap();
+
+        let value = parse_key_value("username", "testuser").unwrap();
+        resolution.update(&[("username", value)]).unwrap();
+        resolution
+            .update(&[("reconnect_interval_secs", Value::Integer(600))])
+            .unwrap();
+        let reread = ConfigFile::read(&path).unwrap().unwrap();
+        assert_eq!(reread.settings.username.as_deref(), Some("testuser"));
+        assert_eq!(reread.settings.reconnect_interval_secs, Some(600));
+
+        let outcome = resolution
+            .remove(&[
+                "reconnect_interval_secs",
+                "portal_url",
+                "reconnect_interval_secs",
+            ])
+            .unwrap();
+        assert_eq!(outcome.removed, [true, false, false]);
+        assert!(outcome.written);
+        let outcome = resolution.remove(&["reconnect_interval_secs"]).unwrap();
+        assert_eq!(outcome.removed, [false]);
+        assert!(!outcome.written);
+
+        // A key this version does not know is not deleted by name.
+        resolution
+            .update(&[("future_key", Value::Integer(1))])
+            .unwrap();
+        let outcome = resolution.remove(&["future_key"]).unwrap();
+        assert_eq!(outcome.removed, [false]);
+        assert!(!outcome.written);
+        assert_eq!(
+            ConfigFile::read(&path)
+                .unwrap()
+                .unwrap()
+                .raw
+                .get("future_key"),
+            Some(&Value::Integer(1))
+        );
+    }
+
+    #[test]
+    fn a_created_file_shows_the_documented_defaults() {
+        let dir = TempDir::new("template");
+        let path = dir.path().join("nested").join(CONFIG_FILE_NAME);
+
+        let mut resolution = Resolution::open(ConfigSource::single(&path)).unwrap();
+        resolution
+            .update(&[("username", Value::String("alice".to_string()))])
+            .unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        for line in [
+            "timeout_ms = 10000",
+            "reconnect_interval_secs = 300",
+            "reconnect_boot_delay_secs = 30",
+        ] {
+            assert!(text.contains(line), "{line} missing from:\n{text}");
+        }
+        assert!(!text.contains("domain ="), "{text}");
+        assert!(!text.contains("callback ="), "{text}");
+        assert_eq!(resolution.effective().username.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn setting_zero_switches_a_background_off() {
+        let dir = TempDir::new("zero");
+        let source = layered_source(&dir);
+        write(
+            &source.layers[0],
+            "reconnect_interval_secs = 600\nreconnect_boot_delay_secs = 60\n",
+        );
+
+        let effective = load_source(&source).unwrap().effective;
+        assert_eq!(effective.reconnect_interval_secs, Some(600));
+        assert_eq!(effective.reconnect_boot_delay_secs, Some(60));
+
+        // A later layer switches one off without unsaying the other.
+        write(&source.layers[1], "reconnect_interval_secs = 0\n");
+        let effective = load_source(&source).unwrap().effective;
+        assert_eq!(effective.reconnect_interval_secs, None);
+        assert_eq!(effective.reconnect_boot_delay_secs, Some(60));
+    }
+
+    #[test]
     fn the_catalogue_covers_every_current_writable_key() {
-        // The current catalogue is what `config set`/`unset` validate against.
-        // Legacy keys have a separate read-only catalogue and are intentionally
-        // excluded from this check.
         let dir = TempDir::new("catalogue");
         let path = dir.path().join(CONFIG_FILE_NAME);
         let mut raw = toml::Table::new();
@@ -1431,11 +1589,8 @@ mod tests {
                 },
             );
         }
-        let text = toml::to_string_pretty(&raw).unwrap();
-        write(&path, &text);
+        write(&path, &toml::to_string_pretty(&raw).unwrap());
 
-        // Parsing succeeds, which means every catalogue key is a real key, and
-        // `entries` returns exactly all of them.
         let file = ConfigFile::read(&path).unwrap().unwrap();
         let names: Vec<&str> = file.entries().into_iter().map(|(name, _)| name).collect();
         assert_eq!(
@@ -1448,177 +1603,28 @@ mod tests {
     }
 
     #[test]
-    fn config_set_and_unset_write_through_the_file() {
-        let dir = TempDir::new("set-unset");
-        let path = dir.path().join(CONFIG_FILE_NAME);
-        ConfigFile::create(&path, &Settings::documented_defaults()).unwrap();
-        let mut resolution = explicit_resolution(&path);
-
-        // `set` accepts what the key's type allows, and refuses the rest.
-        let value = parse_key_value("username", "testuser").unwrap();
-        assert_eq!(value, Value::String("testuser".to_string()));
-        assert_eq!(
-            parse_key_value("timeout_ms", "20000").unwrap(),
-            Value::Integer(20_000)
-        );
-        assert_eq!(
-            parse_key_value("timeout_ms", "soon").unwrap_err(),
-            "key \"timeout_ms\" must be a non-negative integer"
-        );
-        assert_eq!(
-            parse_key_value("timeout_ms", &(i64::MAX as u128 + 1).to_string()).unwrap_err(),
-            "key \"timeout_ms\" must be no greater than 9223372036854775807"
-        );
-        assert_eq!(
-            parse_key_value("read_timeout_ms", "20000").unwrap_err(),
-            "Unknown configuration key: read_timeout_ms"
-        );
-        assert_eq!(
-            parse_key_value("nope", "x").unwrap_err(),
-            "Unknown configuration key: nope"
+    fn the_defaults_match_the_documentation() {
+        let dir = TempDir::new("defaults");
+        let source = layered_source(&dir);
+        write(
+            &source.layers[0],
+            "# nothing but a comment\nextra = \"kept\"\n",
         );
 
-        resolution.update(&[("username", value)]).unwrap();
-        resolution
-            .update(&[("reconnect_interval_secs", Value::Integer(600))])
-            .unwrap();
-        let reread = ConfigFile::read(&path).unwrap().unwrap();
-        assert_eq!(reread.settings.username.as_deref(), Some("testuser"));
-        assert_eq!(reread.settings.reconnect_interval_secs, Some(600));
+        let effective = load_source(&source).unwrap().effective;
 
-        // Removing one key leaves the others, and a second remove is a no-op.
-        assert!(resolution.remove(&["reconnect_interval_secs"]).unwrap());
-        assert!(!resolution.remove(&["reconnect_interval_secs"]).unwrap());
-        let reread = ConfigFile::read(&path).unwrap().unwrap();
-        assert_eq!(reread.settings.reconnect_interval_secs, None);
-        assert_eq!(reread.settings.username.as_deref(), Some("testuser"));
-
-        // A key this version does not know is not deleted by name.
-        resolution
-            .update(&[("future_key", Value::Integer(1))])
-            .unwrap();
-        assert!(!resolution.remove(&["future_key"]).unwrap());
+        assert_eq!(effective, Effective::default());
+        assert_eq!(effective.callback, "jsonp");
         assert_eq!(
-            ConfigFile::read(&path)
-                .unwrap()
-                .unwrap()
-                .raw
-                .get("future_key"),
-            Some(&Value::Integer(1))
+            effective.timeouts,
+            Timeouts {
+                connect_ms: DEFAULT_TIMEOUT_MS,
+                read_ms: DEFAULT_TIMEOUT_MS,
+            }
         );
-    }
-
-    #[test]
-    fn unsetting_returns_to_the_documented_defaults() {
-        let dir = TempDir::new("unset-defaults");
-        let path = dir.path().join(CONFIG_FILE_NAME);
-        ConfigFile::create(&path, &Settings::documented_defaults()).unwrap();
-        let mut resolution = explicit_resolution(&path);
-        resolution
-            .update(&[("reconnect_interval_secs", Value::Integer(600))])
-            .unwrap();
-
-        resolution.remove(&["reconnect_interval_secs"]).unwrap();
-
-        // Gone from the file, so the documented default applies again.
-        let reread = ConfigFile::read(&path).unwrap().unwrap();
-        assert_eq!(reread.settings.reconnect_interval_secs, None);
-        assert_eq!(
-            Effective::layered(&[&reread.settings]).reconnect_interval_secs,
-            Some(300)
-        );
-    }
-
-    #[test]
-    fn a_created_file_shows_the_documented_defaults() {
-        let dir = TempDir::new("template");
-        let paths = scratch_paths(&dir);
-        ConfigFile::create(&paths.system, &Settings::documented_defaults()).unwrap();
-
-        let text = std::fs::read_to_string(&paths.system).unwrap();
-        // Every current key is present with its default.
-        for line in [
-            "timeout_ms = 10000",
-            "reconnect_interval_secs = 300",
-            "reconnect_boot_delay_secs = 30",
-        ] {
-            assert!(text.contains(line), "{line} missing from:\n{text}");
-        }
-        // Nothing obsolete was invented.
-        assert!(!text.contains("domain ="), "{text}");
-        assert!(!text.contains("callback ="), "{text}");
-        assert!(!text.contains("connect_timeout_ms ="), "{text}");
-        assert!(!text.contains("read_timeout_ms ="), "{text}");
-        assert!(!text.contains("username ="), "{text}");
-        assert!(!text.contains("portal_url ="), "{text}");
-
-        // The template means what it says: read back, it is the same effective
-        // settings as a configuration that says nothing at all.
-        let effective = load_existing(&paths, None).unwrap();
+        assert_eq!(effective.portal_url, None);
         assert_eq!(effective.reconnect_interval_secs, Some(300));
         assert_eq!(effective.reconnect_boot_delay_secs, Some(30));
-        assert_eq!(effective.timeouts, Effective::default().timeouts);
-        assert_eq!(effective.domain, None);
-    }
-
-    #[test]
-    fn setting_zero_switches_a_background_off() {
-        let dir = TempDir::new("zero");
-        let paths = scratch_paths(&dir);
-        write(
-            &paths.system,
-            "reconnect_interval_secs = 600\nreconnect_boot_delay_secs = 60\n",
-        );
-
-        let resolution = resolve(&paths, None, None, &mut never_asked).unwrap();
-        assert_eq!(resolution.effective.reconnect_interval_secs, Some(600));
-        assert_eq!(resolution.effective.reconnect_boot_delay_secs, Some(60));
-
-        // A later layer switches one off without unsaying the other.
-        write(&paths.portable, "reconnect_interval_secs = 0\n");
-        let resolution = resolve(&paths, None, None, &mut never_asked).unwrap();
-        assert_eq!(resolution.effective.reconnect_interval_secs, None);
-        assert_eq!(resolution.effective.reconnect_boot_delay_secs, Some(60));
-    }
-
-    #[test]
-    fn bad_value_reports_path_and_key() {
-        let dir = TempDir::new("bad-value");
-        let paths = scratch_paths(&dir);
-        write(&paths.system, "connect_timeout_ms = \"x\"\n");
-
-        let err = resolve(&paths, None, None, &mut never_asked).unwrap_err();
-
-        let message = err.to_string();
-        assert!(message.contains("connect_timeout_ms"), "{message}");
-        assert!(
-            message.contains(&paths.system.display().to_string()),
-            "{message}"
-        );
-        assert!(matches!(err, ConfigError::Format { .. }));
-
-        // A negative timeout is not a duration.
-        write(&paths.system, "read_timeout_ms = -1\n");
-        assert!(matches!(
-            load_existing(&paths, None),
-            Err(ConfigError::Format { .. })
-        ));
-
-        // The reconnect keys are seconds, and reject the same way.
-        write(&paths.system, "reconnect_interval_secs = \"often\"\n");
-        let message = resolve(&paths, None, None, &mut never_asked)
-            .unwrap_err()
-            .to_string();
-        assert!(message.contains("reconnect_interval_secs"), "{message}");
-        assert!(
-            message.contains("must be a non-negative integer"),
-            "{message}"
-        );
-        write(&paths.system, "reconnect_boot_delay_secs = -5\n");
-        assert!(matches!(
-            load_existing(&paths, None),
-            Err(ConfigError::Format { .. })
-        ));
     }
 
     #[test]
@@ -1632,5 +1638,45 @@ mod tests {
             portable_config_path().unwrap(),
             sys::exe_dir().unwrap().join(CONFIG_FILE_NAME)
         );
+    }
+
+    /// Whether the default write target exists *now*, so a test can prove
+    /// discovery changed nothing without assuming a clean machine.
+    fn source_default_write_path() -> bool {
+        system_config_path()
+            .map(|path| path.exists())
+            .unwrap_or(false)
+            || portable_config_path()
+                .map(|path| path.exists())
+                .unwrap_or(false)
+    }
+
+    #[test]
+    fn discover_never_creates_or_asks() {
+        let dir = TempDir::new("discover");
+        let explicit = dir.path().join("chosen.toml");
+        let source = ConfigSource::discover(Some(&explicit), None).unwrap();
+        assert_eq!(source.layers, vec![explicit.clone()]);
+        assert_eq!(source.write_path, explicit);
+        assert!(source.legacy_path.is_none());
+        assert!(!explicit.exists());
+
+        // The default source lists both platform locations, and the write
+        // target is whichever exists, without any file being created.
+        let before = source_default_write_path();
+        let source = ConfigSource::discover(None, None).unwrap();
+        assert!(!source.layers.is_empty());
+        assert_eq!(
+            source.write_path.exists(),
+            before,
+            "discovery reads, it never creates"
+        );
+        // A forced location only decides where a *new* file would go; an
+        // existing configuration keeps being written where it already is.
+        let portable = ConfigSource::discover(None, Some(Storage::Portable)).unwrap();
+        let chosen = portable_config_path().unwrap();
+        if !system_config_path().unwrap().exists() && !chosen.exists() {
+            assert_eq!(portable.write_path, chosen);
+        }
     }
 }

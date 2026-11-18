@@ -42,6 +42,9 @@ pub enum ConfigError {
     /// A configuration file is not valid for its format; `detail` names the
     /// offending key where there is one.
     Format { path: PathBuf, detail: String },
+    /// The merged configuration is readable but unusable: a value is out of
+    /// range, or something the command needs is missing.
+    Invalid(String),
 }
 
 impl std::fmt::Display for ConfigError {
@@ -51,6 +54,7 @@ impl std::fmt::Display for ConfigError {
             ConfigError::PortalUrlInvalid => f.write_str(messages::PORTAL_URL_INVALID),
             ConfigError::Io(detail) | ConfigError::Json(detail) => f.write_str(detail),
             ConfigError::Format { path, detail } => write!(f, "{}: {detail}", path.display()),
+            ConfigError::Invalid(detail) => f.write_str(detail),
         }
     }
 }

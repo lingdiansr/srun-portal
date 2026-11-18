@@ -17,24 +17,32 @@
 //! | [`api`] | request construction for every endpoint [§7], [§8] |
 //! | [`translate`] | error-code to message dispatch [§10] |
 //! | [`config`] | `~/.srun_portal.json` (legacy, read-only) and portal-URL resolution [§3.1] |
-//! | [`settings`] | configuration file discovery, layering and first-run creation [§3.1] |
-//! | [`credentials`] | the `0600` password-file fallback |
+//! | [`settings`] | configuration sources, layering, locked read-modify-write, validation [§3.1] |
+//! | [`persistence`] | atomic replacement writes, cross-process lock files, private creation |
+//! | [`control`] | the per-user control directory: install record, pause, health, events |
+//! | [`process`] | bounded child processes: deadline, output cap, whole-tree cleanup |
+//! | [`credentials`] | portal-and-account credential keys and the private-file fallback |
 //! | [`keyring`] | the system credential facility (Secret Service, Credential Manager, keychain) |
 //! | [`sys`] | passwd entry, network interfaces, device identity, signal handlers |
 //! | [`util`] | `wait`, `promiseAny` |
-//! | [`format`] | `formatFlow` / `formatTime` |
+//! | `format` | `formatFlow` / `formatTime` |
 //! | [`runtime`] | the authentication state machine [§5], [§8], [§9] |
 //! | [`reconnect`] | one non-interactive "check, log in when needed" pass [§5], [§8] |
 //! | [`service`] | the per-system background task definition (systemd, launchd, Task Scheduler) |
-//! | [`cli`] | interactive shell: banner, prompts, retry loop [§5], [§10] |
+//! | [`cli`] | command dispatch, the supervised worker, and the interactive shell [§5], [§10] |
 //!
 //! The crate also has an unattended half: [`reconnect`] performs SPEC §5's check
 //! and login once, [`credentials`] keeps the password it needs in the system's
 //! own credential facility ([`keyring`]: Secret Service, Credential Manager or
-//! keychain) or, where none is usable, a `0600` file beside the configuration,
+//! keychain) or, where none is usable, a private file in the control directory,
 //! and [`service`] registers that one-shot command with systemd, launchd or the
 //! Windows Task Scheduler. Nothing there changes the protocol behaviour above —
 //! it drives the same [`runtime`] with the same requests.
+//!
+//! Everything that can talk to the portal runs under one discipline: the
+//! user's operation lock, a worker child, and a 90-second deadline
+//! ([`cli::DEADLINE`]). A pause written by `disconnect`/`service stop` reaches
+//! every entry point, including the installed one.
 //!
 //! Fidelity policy: the HTTP contract is reproduced exactly. Where the spec
 //! records a defect or asks for an explicit decision (SPEC §12), the choice is
@@ -46,12 +54,15 @@ mod account;
 pub mod api;
 pub mod cli;
 pub mod config;
+pub mod control;
 pub mod credentials;
 pub mod crypto;
 pub mod format;
 pub mod html;
 pub mod keyring;
+pub mod persistence;
 pub mod portal_config;
+pub mod process;
 pub mod reconnect;
 pub mod runtime;
 pub mod service;
