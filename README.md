@@ -8,7 +8,10 @@
 HTTP 请求。加密、查询参数顺序、JSONP、登录状态机和登出流程均由捕获向量、
 stub portal 流程测试和差分验证约束。
 
-当前版本：`0.1.0`
+后台部分的目标是**可观测、可暂停、可离线部署**：安装不访问 Portal，每次运行
+都有硬期限和结构化结果，`disconnect`/`resume` 让“主动断网”成为一等操作。
+
+当前版本：`0.1.0`（Rust 1.89+）
 
 ## 快速开始
 
@@ -19,37 +22,50 @@ cargo run --example live_check -- 'https://net.szu.edu.cn/srun_portal_pc?ac_id=1
 cargo test --all-targets
 ```
 
-Portal URL 的解析顺序为：命令行位置参数、配置文件中的 `portal_url`、交互式
-输入。`live_check` 只执行只读请求，不会登录、登出或写入配置。
+交互入口的 Portal URL 可用位置参数或 `--portal-url` 指定，两者互斥；任一命令行
+形式都高于配置文件中的 `portal_url`，配置文件又高于交互输入。`live_check` 只执行
+只读请求，不会登录、登出或写入配置。
 
 ## CLI
 
 ```text
 srun-portal [options] [portal-url]
-srun-portal [options] reconnect
-srun-portal [options] service install|uninstall|status|forget
-srun-portal [options] config show|list|set|unset
+srun-portal [options] reconnect | disconnect | resume
+srun-portal [options] service install|uninstall|status|start|stop|restart|logs
+srun-portal [options] config show|list|set|unset|validate
+srun-portal [options] credentials set|forget|status
 ```
-
-常用命令：
 
 | 命令 | 作用 |
 |---|---|
 | `reconnect` | 检查当前在线状态，仅在需要时登录一次 |
-| `service install` | 注册当前用户的后台重连接任务 |
-| `service status` | 查看任务、配置和凭据状态 |
-| `service uninstall` | 删除后台任务，不删除凭据 |
-| `service forget` | 删除保存的密码 |
-| `config show` | 显示合并后的有效配置 |
-| `config list` | 显示当前文件实际设置的键 |
-| `config set KEY VALUE` | 设置一个或多个配置项 |
-| `config unset KEY` | 删除配置项，显露较低优先级文件的值或默认值 |
+| `disconnect` | 先持久暂停后台重连接，再登出（离线视为成功） |
+| `resume` | 解除暂停并立即检查 |
+| `service install` | 注册后台重连接任务；**不访问 Portal**、不验证密码 |
+| `service status` | 安装状态、暂停状态、配置来源、上次结果和平台视图 |
+| `service start` / `stop` / `restart` | 暂停/恢复并立即检查，或停止在途运行 |
+| `service logs` | 最近 200 条事件（文本或 `--json` 数组） |
+| `service uninstall` | 删除任务定义；保留凭据、暂停状态与历史 |
+| `config show` | 合并后的有效配置，以及每个值来自哪个文件 |
+| `config list` | 当前写入文件实际设置的键 |
+| `config set KEY VALUE` | 整批校验后再写入 |
+| `config unset KEY` | 删除键，显露较低层或默认值 |
+| `config validate` | 校验有效配置（不完整即退出 2） |
+| `credentials set` | 保存当前 Portal + 账号的密码（`--store auto|file|keyring`） |
+| `credentials forget` | 删除该条密码；`--legacy` 清理旧的无归属条目 |
+| `credentials status` | 密码来自环境、文件、钥匙串还是没有 |
 
 选项：
 
-- `--config <path>`：只使用指定配置文件；文件不存在时创建。
+- `--config <path>`：只使用指定配置文件；只有初始化命令会创建它。
 - `--portable`：首次创建配置时，放在可执行文件旁边。
-- `--help` / `-h`：显示帮助。
+- `--json`：`config show|validate`、`credentials status`、`service status|logs`、
+  `reconnect|disconnect|resume` 的机器可读输出。
+- `--version` / `-V`：版本。
+- `--help` / `-h`：帮助。
+
+退出码：`0` 成功 / 未安装 / 已暂停 / 忙；`2` 参数或配置错误；`3` 凭据、平台或
+持久化错误；`4` 网络、认证、协议或任务总期限失败。
 
 ## 配置与后台任务
 
@@ -65,10 +81,17 @@ username = "testuser@example"
 timeout_ms = 10000
 ```
 
-后台任务始终以当前用户身份运行。密码优先保存到操作系统凭据设施，并以包含
-`@domain` 的完整有效登录身份隔离；没有可用凭据设施时，才回退到配置目录旁、
-权限为 `0600` 的凭据文件。受旧版裸用户名凭据键缺陷影响的升级用户需要重新运行
-`service install`；新版本不会把裸键密码作为域名账号的回退。
+后台任务始终以当前用户身份运行，只执行一次性的
+`srun-portal __background --control-dir <目录> --trigger interval|startup`；调度
+完全交给原生机制（systemd user timer、launchd LaunchAgent、Task Scheduler），
+没有常驻 daemon 或 IPC。
+
+密码按 `Portal origin + 完整账号` 隔离，优先保存到操作系统凭据设施，不可用时
+回退到控制目录下权限为 `0600`（Windows：仅当前 SID 与 SYSTEM 的 DACL）的
+`credentials.toml`；该文件条目优先于钥匙串读取，确保回退后写入的新密码不会被
+旧钥匙串值覆盖。`SRUN_PORTAL_PASSWORD` 优先于两者。旧版无归属条目不会被自动
+绑定到任何 Portal：`credentials status` 会报告 `legacy_unscoped`，用
+`credentials forget --legacy` 清理后重新保存一次即可。
 
 ## 代码结构
 
@@ -79,32 +102,44 @@ timeout_ms = 10000
 | `html` / `portal_config` | 解析 Portal 配置页和 `PortalFlags` |
 | `api` | 构造并发送各 Portal API 请求 |
 | `runtime` | 在线检查、登录、双栈和登出状态机 |
-| `config` / `settings` | 旧 JSON 读取、TOML 配置发现、分层和首次创建 |
-| `credentials` / `keyring` | 凭据设施和 `0600` 文件回退 |
-| `reconnect` / `service` | 无交互重连接和平台后台任务 |
-| `cli` / `sys` | 交互式命令行、系统探测和输入处理 |
+| `config` / `settings` | 旧 JSON 读取、TOML 分层、`ConfigSource`、只读加载与校验 |
+| `persistence` | 原子替换写入、跨进程 `.lock` 文件锁、私有文件创建 |
+| `control` | 控制目录：`installed.toml`、`control.toml`、`health.json`、`events.json`、`operation.lock` |
+| `process` | 有限期子进程监督：时间上限、输出上限、进程组/Job 回收 |
+| `credentials` / `keyring` | v2 凭据键、文件回退与平台凭据设施 |
+| `reconnect` / `service` | 类型化的一次性重连接、平台任务计划 |
+| `cli` / `cli/supervisor` | 命令分发、监督器（worker + 期限 + 信号）、交互式流程 |
+| `sys` | 系统探测和输入处理 |
 
 `src/main.rs` 是命令行入口；`examples/live_check.rs` 是只读实时检查入口。
 
 ## 验证状态
 
-当前本地基线：
-
 ```text
-cargo fmt --all -- --check                 通过
-cargo clippy --all-targets -- -D warnings  通过
-cargo test --all-targets                    153 passed
-cargo build --release                       通过
+cargo test --lib --test flow --test vectors --test background   通过
+cargo clippy --all-targets -- -D warnings                       通过
+cargo build --release                                           通过
 ```
 
-仓库 CI 还会在 Linux、macOS、Windows 上执行目标构建和 CLI smoke check。协议
-保真、测试分层、参考二进制差分、真实 Portal 检查以及已知偏差见
+`tests/service_native.rs` 是需要真实平台会话的显式验收，默认 `#[ignore]`：
+
+```text
+SRUN_PORTAL_NATIVE_TESTS=1 cargo test --test service_native -- --ignored --test-threads=1
+```
+
+它要求一个专用一次性账号（无既有 srun-portal 任务、有可用的 user manager /
+GUI 会话 / Task Scheduler），注册并跨进程验证 `install → status → stop → start →
+restart → uninstall`、双触发器关闭后的残留清理、以及各平台的原生字段（systemd
+`ExecMainStatus`、launchd 两个 label 与启动延迟、Task Scheduler 的 SID/限时/分钟
+取整）。
+
+协议保真、测试分层、参考二进制差分、真实 Portal 检查以及已知偏差见
 [协议保真与验证](docs/protocol.md)。
 
 ## 项目边界
 
-已实现：标准 Portal PC 流程、双栈探测、JSONP API、交互登录、DM 登出、一次性
-后台重连接、三类平台任务和多种凭据后端。
+已实现：标准 Portal PC 流程、双栈探测、JSONP API、交互登录、DM 登出、带期限与
+结构化结果的后台重连接、主动断网/恢复、三类平台任务和多种凭据后端。
 
 明确不在当前协议范围内：
 
@@ -113,7 +148,7 @@ cargo build --release                       通过
 - dorm `eportal` 协议
 - User-Agent 伪装
 - captcha 探测
-- 常驻重连接 daemon
+- 常驻重连接 daemon 或本地 IPC
 - 设备接口和 `ac_id` 配置覆盖
 
 这些内容不会在协议层之外被隐式加入。扩展边界和 clean-room 说明见
