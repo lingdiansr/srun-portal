@@ -71,9 +71,8 @@ pub fn delete(account: &str) -> Result<bool, String> {
 #[cfg(target_os = "linux")]
 mod imp {
     use super::{Availability, SERVICE};
-    use std::io::Write;
+    use crate::process::{Outcome, Stop};
     use std::path::{Path, PathBuf};
-    use std::process::{Command, Stdio};
 
     /// The libsecret CLI.
     const TOOL: &str = "secret-tool";
@@ -98,34 +97,41 @@ mod imp {
 
     pub fn read(account: &str) -> Result<Option<String>, String> {
         let argv = lookup_argv(account);
-        let output = run_captured(&argv, None)?;
-        match output.status.code() {
-            Some(0) => {
-                let text = String::from_utf8_lossy(&output.stdout);
-                // `secret-tool` terminates the secret with one newline.
-                Ok(Some(text.strip_suffix('\n').unwrap_or(&text).to_string()))
-            }
+        let outcome = run_captured(&argv, None)?;
+        match exit_code(&outcome) {
+            Some(0) => Ok(Some(
+                outcome.stdout_text().trim_end_matches('\n').to_string(),
+            )),
             Some(1) => Ok(None),
-            _ => Err(format!("{} failed: {}", argv.join(" "), detail(&output))),
+            _ => Err(format!("{} failed: {}", argv.join(" "), detail(&outcome))),
         }
     }
 
     pub fn store(account: &str, password: &str) -> Result<(), String> {
         let argv = store_argv(account);
-        let output = run_captured(&argv, Some(password.as_bytes()))?;
-        if output.status.success() {
+        let outcome = run_captured(&argv, Some(password.as_bytes()))?;
+        if outcome.succeeded() {
             return Ok(());
         }
-        Err(format!("{} failed: {}", argv.join(" "), detail(&output)))
+        Err(format!("{} failed: {}", argv.join(" "), detail(&outcome)))
     }
 
     pub fn delete(account: &str) -> Result<bool, String> {
         let argv = delete_argv(account);
-        let output = run_captured(&argv, None)?;
-        match output.status.code() {
+        let outcome = run_captured(&argv, None)?;
+        match exit_code(&outcome) {
             Some(0) => Ok(true),
             Some(1) => Ok(false),
-            _ => Err(format!("{} failed: {}", argv.join(" "), detail(&output))),
+            _ => Err(format!("{} failed: {}", argv.join(" "), detail(&outcome))),
+        }
+    }
+
+    /// The exit status, or `None` when the deadline killed the tool — which is
+    /// never the same as "no such item".
+    fn exit_code(outcome: &Outcome) -> Option<i32> {
+        match &outcome.stop {
+            Stop::Exited(status) => status.code(),
+            _ => None,
         }
     }
 
@@ -152,43 +158,25 @@ mod imp {
             .collect()
     }
 
-    /// Run the tool, optionally feeding it `stdin`.
-    fn run_captured(argv: &[String], stdin: Option<&[u8]>) -> Result<std::process::Output, String> {
-        let mut child = Command::new(&argv[0])
-            .args(&argv[1..])
-            .stdin(if stdin.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|err| format!("{} failed: {err}", argv.join(" ")))?;
-        if let Some(bytes) = stdin {
-            let mut handle = child
-                .stdin
-                .take()
-                .ok_or_else(|| format!("{}: stdin was not available", argv.join(" ")))?;
-            handle
-                .write_all(bytes)
-                .map_err(|err| format!("{} failed: {err}", argv.join(" ")))?;
-            // Dropping the handle closes the pipe, which is what `secret-tool`
-            // reads until.
-        }
-        child
-            .wait_with_output()
-            .map_err(|err| format!("{} failed: {err}", argv.join(" ")))
+    /// Run the tool, optionally feeding it `stdin`, under a hard deadline.
+    ///
+    /// `secret-tool` talks to another process on the session bus, so it can block
+    /// on a wallet that is asking for an unlock that nobody can give. The
+    /// supervisor kills the whole tree at [`crate::process::CREDENTIAL_LIMIT`], so
+    /// the background task never waits on a prompt.
+    fn run_captured(argv: &[String], stdin: Option<&[u8]>) -> Result<Outcome, String> {
+        let outcome = crate::process::run(argv, stdin, crate::process::CREDENTIAL_LIMIT)
+            .map_err(|err| err.to_string())?;
+        Ok(outcome)
     }
 
-    /// The stderr of a failed run, or the exit status when it said nothing.
-    fn detail(output: &std::process::Output) -> String {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stderr = stderr.trim();
+    /// The stderr of a failed run, or how it stopped when it said nothing.
+    fn detail(outcome: &Outcome) -> String {
+        let stderr = outcome.stderr_text();
         if stderr.is_empty() {
-            format!("exit status {}", output.status)
+            outcome.describe_stop()
         } else {
-            stderr.to_string()
+            stderr
         }
     }
 
@@ -239,14 +227,14 @@ mod imp {
             ]),
         ];
         for probe in probes {
-            let Ok(output) = Command::new(&probe[0]).args(&probe[1..]).output() else {
+            let Ok(outcome) = crate::process::run(&probe, None, crate::process::CREDENTIAL_LIMIT)
+            else {
                 continue;
             };
-            if !output.status.success() {
+            if !outcome.succeeded() {
                 continue;
             }
-            let text = String::from_utf8_lossy(&output.stdout);
-            return Some(text.contains("true"));
+            return Some(outcome.stdout_text().contains("true"));
         }
         None
     }
@@ -355,115 +343,101 @@ mod imp {
     }
 }
 
-/// The login keychain, through `security(1)`.
+/// The login keychain, through Security.framework.
+///
+/// No subprocess, so no password ever reaches an argument list or a pipe, and
+/// no `security(1)` parsing in which a missing item and a denied one look alike.
+/// The API answers a distinct `errSecItemNotFound`, which is the only status
+/// mapped to "nothing stored"; every other status is reported as unavailable.
+///
+/// The keychain would otherwise be entitled to put an authorization dialog on
+/// the screen — impossible for the installed task, which has no terminal and no
+/// user in front of it, and wrong for a command that must not block. Interaction
+/// is therefore switched off for the duration of each operation and restored
+/// afterwards; a failure to switch it off is an error, because guessing would
+/// mean the task could hang on a prompt.
 #[cfg(target_os = "macos")]
 mod imp {
     use super::{Availability, SERVICE};
-    use std::process::{Command, Stdio};
-
-    const TOOL: &str = "security";
+    use security_framework::passwords::{
+        delete_generic_password, generic_password, set_generic_password, PasswordOptions,
+    };
+    use security_framework_sys::base::errSecItemNotFound;
 
     pub fn availability() -> Availability {
-        // Login keychains are created by the system at first login, so the tool
-        // existing is the whole question.
         Availability::Ready
     }
 
     pub fn read(account: &str) -> Result<Option<String>, String> {
-        let argv = lookup_argv(account);
-        let output = run(&argv)?;
-        match output.status.code() {
-            Some(0) => {
-                let text = String::from_utf8_lossy(&output.stdout);
-                Ok(Some(text.strip_suffix('\n').unwrap_or(&text).to_string()))
-            }
-            // `security` reports a missing item as a non-zero exit with a
-            // "could not be found" message.
-            _ if missing(&output) => Ok(None),
-            _ => Err(format!("{} failed: {}", argv.join(" "), detail(&output))),
+        let _guard = NoInteraction::engage()?;
+        match generic_password(PasswordOptions::new_generic_password(SERVICE, account)) {
+            Ok(bytes) => String::from_utf8(bytes)
+                .map(Some)
+                .map_err(|err| format!("the stored password for {account} is not UTF-8: {err}")),
+            Err(err) if err.code() == errSecItemNotFound => Ok(None),
+            Err(err) => Err(format!(
+                "cannot read the keychain item for {account}: {err}"
+            )),
         }
     }
 
     pub fn store(account: &str, password: &str) -> Result<(), String> {
-        // `-w` takes the password from the argument here, so it goes in the
-        // process table for the moment the command runs; `security` has no
-        // stdin form for a generic password.
-        let argv = store_argv(account, password);
-        let output = run(&argv)?;
-        if output.status.success() {
-            return Ok(());
-        }
-        Err(format!(
-            "security add-generic-password failed: {}",
-            detail(&output)
-        ))
+        let _guard = NoInteraction::engage()?;
+        set_generic_password(SERVICE, account, password.as_bytes())
+            .map_err(|err| format!("cannot write the keychain item for {account}: {err}"))
     }
 
     pub fn delete(account: &str) -> Result<bool, String> {
-        let argv = delete_argv(account);
-        let output = run(&argv)?;
-        if output.status.success() {
-            return Ok(true);
+        let _guard = NoInteraction::engage()?;
+        match delete_generic_password(SERVICE, account) {
+            Ok(()) => Ok(true),
+            Err(err) if err.code() == errSecItemNotFound => Ok(false),
+            Err(err) => Err(format!(
+                "cannot delete the keychain item for {account}: {err}"
+            )),
         }
-        if missing(&output) {
-            return Ok(false);
+    }
+
+    /// Switches keychain user interaction off, and restores the previous setting
+    /// on drop.
+    struct NoInteraction {
+        previous: bool,
+    }
+
+    impl NoInteraction {
+        fn engage() -> Result<NoInteraction, String> {
+            unsafe {
+                let mut allowed: u8 = 1;
+                let status = security_framework_sys::keychain::SecKeychainGetUserInteractionAllowed(
+                    &mut allowed,
+                );
+                if status != 0 {
+                    return Err(format!(
+                        "cannot read the keychain interaction setting (OSStatus {status})"
+                    ));
+                }
+                let status =
+                    security_framework_sys::keychain::SecKeychainSetUserInteractionAllowed(0);
+                if status != 0 {
+                    return Err(format!(
+                        "cannot disable keychain interaction (OSStatus {status}); \
+                         refusing to risk a prompt"
+                    ));
+                }
+                Ok(NoInteraction {
+                    previous: allowed != 0,
+                })
+            }
         }
-        Err(format!("{} failed: {}", argv.join(" "), detail(&output)))
     }
 
-    fn lookup_argv(account: &str) -> Vec<String> {
-        argv(&["find-generic-password", "-s", SERVICE, "-a", account, "-w"])
-    }
-
-    fn store_argv(account: &str, password: &str) -> Vec<String> {
-        argv(&[
-            "add-generic-password",
-            "-U",
-            "-s",
-            SERVICE,
-            "-a",
-            account,
-            "-w",
-            password,
-        ])
-    }
-
-    fn delete_argv(account: &str) -> Vec<String> {
-        argv(&["delete-generic-password", "-s", SERVICE, "-a", account])
-    }
-
-    fn argv(parts: &[&str]) -> Vec<String> {
-        std::iter::once(TOOL.to_string())
-            .chain(parts.iter().map(|part| (*part).to_string()))
-            .collect()
-    }
-
-    fn run(argv: &[String]) -> Result<std::process::Output, String> {
-        let child = Command::new(&argv[0])
-            .args(&argv[1..])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|err| format!("{} failed: {err}", argv[0]))?;
-        child
-            .wait_with_output()
-            .map_err(|err| format!("{} failed: {err}", argv[0]))
-    }
-
-    /// `security` has no distinct exit code for "not found": it says so.
-    fn missing(output: &std::process::Output) -> bool {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        stderr.contains("could not be found") || stderr.contains("SecKeychainSearchCopyNext")
-    }
-
-    fn detail(output: &std::process::Output) -> String {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stderr = stderr.trim();
-        if stderr.is_empty() {
-            format!("exit status {}", output.status)
-        } else {
-            stderr.to_string()
+    impl Drop for NoInteraction {
+        fn drop(&mut self) {
+            unsafe {
+                security_framework_sys::keychain::SecKeychainSetUserInteractionAllowed(
+                    if self.previous { 1 } else { 0 },
+                );
+            }
         }
     }
 }
@@ -545,8 +519,12 @@ mod tests {
 
     /// The real facility, when the machine running the tests has one. The entry
     /// is written under a name only this test uses and removed again.
+    ///
+    /// Ignored by default: the ordinary suite must never write to a real wallet,
+    /// where an interrupted run would leave a secret behind.
     #[cfg(target_os = "linux")]
     #[test]
+    #[ignore = "writes to the real keyring; run explicitly on a disposable account"]
     fn a_real_wallet_round_trips() {
         if !availability().is_ready() {
             return; // headless: nothing to exercise, the file fallback covers it
