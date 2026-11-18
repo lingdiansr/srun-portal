@@ -96,11 +96,9 @@ fn main() {
 /// The configured `portal_url`, without creating, writing or asking for
 /// anything: this example is read-only (SPEC §13.3).
 fn configured_slug() -> Option<String> {
-    let paths = settings::Paths::discover().ok()?;
     let explicit = std::env::var_os(settings::ENV_CONFIG_PATH).map(std::path::PathBuf::from);
-    settings::load_existing(&paths, explicit.as_deref())
-        .ok()?
-        .portal_url
+    let source = settings::ConfigSource::discover(explicit.as_deref(), None).ok()?;
+    settings::load_source(&source).ok()?.effective.portal_url
 }
 
 fn die(message: &str) -> ! {

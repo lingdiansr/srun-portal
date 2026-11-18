@@ -1,3 +1,4 @@
+use crate::credentials::Target;
 use crate::settings;
 use std::path::PathBuf;
 
@@ -9,6 +10,11 @@ pub(super) struct Args {
     pub(super) portable: bool,
     pub(super) help: bool,
     help_topic: Option<HelpTopic>,
+    pub(super) version: bool,
+    /// `--json` for the commands that have a machine-readable form.
+    pub(super) json: bool,
+    /// The hidden `--control-dir` of the installed entry point.
+    pub(super) control_dir: Option<PathBuf>,
     pub(super) setting_options: Vec<(String, String)>,
     pub(super) command: Option<Command>,
 }
@@ -17,23 +23,50 @@ pub(super) struct Args {
 enum HelpTopic {
     Global,
     Reconnect,
+    Disconnect,
+    Resume,
     Service,
     ServiceInstall,
     ServiceUninstall,
     ServiceStatus,
-    ServiceForget,
+    ServiceStart,
+    ServiceStop,
+    ServiceRestart,
+    ServiceLogs,
     Config,
     ConfigShow,
     ConfigList,
     ConfigSet,
     ConfigUnset,
+    ConfigValidate,
+    Credentials,
+    CredentialsSet,
+    CredentialsForget,
+    CredentialsStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Command {
     Reconnect,
+    Disconnect,
+    Resume,
     Service(ServiceAction),
     Config(ConfigAction),
+    Credentials(CredentialsAction),
+    /// The entry point the installed task runs.
+    Background {
+        trigger: Trigger,
+        startup_delay_secs: Option<u64>,
+    },
+    /// The child that performs one network pass, driven over stdin.
+    Worker,
+}
+
+/// Which native trigger started a background run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Trigger {
+    Interval,
+    Startup,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,7 +74,10 @@ pub(super) enum ServiceAction {
     Install,
     Uninstall,
     Status,
-    Forget,
+    Start,
+    Stop,
+    Restart,
+    Logs,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,16 +86,27 @@ pub(super) enum ConfigAction {
     List,
     Set(Vec<(String, String)>),
     Unset(Vec<String>),
+    Validate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CredentialsAction {
+    Set(Target),
+    Forget { legacy: bool },
+    Status,
 }
 
 pub(super) const USAGE: &str = r#"Usage: srun-portal [options] [portal-url]
-       srun-portal [options] reconnect
-       srun-portal [options] service install|uninstall|status|forget
-       srun-portal [options] config show|list|set|unset
+       srun-portal [options] reconnect|disconnect|resume
+       srun-portal [options] service install|uninstall|status|start|stop|restart|logs
+       srun-portal [options] config show|list|set|unset|validate
+       srun-portal [options] credentials set|forget|status
 
 Options:
-  --config <path>   use exactly this configuration file (created when missing)
-  --portable        keep the configuration next to the executable
+  --config <path>   use exactly this configuration file
+  --portable        prefer the configuration next to the executable
+  --json            machine-readable output (where a command has one)
+  --version, -V     print the version and exit
   --help, -h        print this help and exit
 
 Interactive/reconnect/service install settings:
@@ -72,18 +119,28 @@ Service install only:
 
 Commands:
   reconnect              check the connection once and log in when needed
+  disconnect             pause the background task and sign out
+  resume                 clear the pause and check the connection now
   service install        install the background reconnect task for this system
-  service uninstall      remove it
-  service status         show what is installed and what the system says
-  service forget         delete the stored password (keyring and file)
-  config show            print every effective setting
-  config list             print the keys the configuration file itself sets
+  service uninstall      remove it and keep credentials
+  service status         show what is installed, paused, and what the system says
+  service start          clear the pause and check now (requires an install)
+  service stop           pause the task and stop a run in progress
+  service restart        stop, then start
+  service logs           show the recent events
+  config show            print every effective setting and where it comes from
+  config list            print the keys the written file sets
   config set KEY VALUE   change one setting (repeatable)
   config unset KEY       remove one setting (repeatable)
+  config validate        check that the effective configuration is usable
+  credentials set        store the password for this portal and account
+  credentials forget     delete it (--legacy: also the old unscoped entries)
+  credentials status     where the password comes from, if anywhere
 
 Environment:
   SRUN_PORTAL_CONFIG     configuration file path (same as --config)
-  SRUN_PORTAL_PASSWORD   password for `reconnect` (overrides the stored one)
+  SRUN_PORTAL_PASSWORD   password for reconnect/disconnect (overrides the stored one)
+  SRUN_PORTAL_STATE_DIR  control directory (install records, pause, history)
 "#;
 
 fn setting_option(arg: &str) -> Option<(&'static str, Option<&str>)> {
@@ -108,6 +165,9 @@ pub(super) fn parse(argv: &[String]) -> Result<Args, String> {
         portable: false,
         help: false,
         help_topic: None,
+        version: false,
+        json: false,
+        control_dir: None,
         setting_options: Vec::new(),
         command: None,
     };
@@ -128,13 +188,29 @@ pub(super) fn parse(argv: &[String]) -> Result<Args, String> {
             continue;
         }
 
+        // `--json` is a global switch: it is accepted anywhere a command is, and
+        // rejected afterwards for the commands that have no JSON form.
+        if arg == "--json" {
+            args.json = true;
+            continue;
+        }
+
         if args.command.is_none() && arg == "reconnect" {
             args.command = Some(Command::Reconnect);
             continue;
         }
+        if args.command.is_none() && arg == "disconnect" {
+            args.command = Some(Command::Disconnect);
+            continue;
+        }
+        if args.command.is_none() && arg == "resume" {
+            args.command = Some(Command::Resume);
+            continue;
+        }
         if args.command.is_none() && arg == "service" {
             let action = rest.next().ok_or_else(|| {
-                "service needs an action: install, uninstall, status or forget".to_string()
+                "service needs an action: install, uninstall, status, start, stop, restart or logs"
+                    .to_string()
             })?;
             if matches!(action.as_str(), "-h" | "--help") {
                 args.help = true;
@@ -145,16 +221,19 @@ pub(super) fn parse(argv: &[String]) -> Result<Args, String> {
                 "install" => ServiceAction::Install,
                 "uninstall" => ServiceAction::Uninstall,
                 "status" => ServiceAction::Status,
-                "forget" => ServiceAction::Forget,
+                "start" => ServiceAction::Start,
+                "stop" => ServiceAction::Stop,
+                "restart" => ServiceAction::Restart,
+                "logs" => ServiceAction::Logs,
                 other => return Err(format!("Unknown service action: {other}")),
             };
             args.command = Some(Command::Service(action));
             continue;
         }
         if args.command.is_none() && arg == "config" {
-            let action = rest
-                .next()
-                .ok_or_else(|| "config needs an action: show, list, set or unset".to_string())?;
+            let action = rest.next().ok_or_else(|| {
+                "config needs an action: show, list, set, unset or validate".to_string()
+            })?;
             if matches!(action.as_str(), "-h" | "--help") {
                 args.help = true;
                 args.help_topic = Some(HelpTopic::Config);
@@ -181,6 +260,7 @@ pub(super) fn parse(argv: &[String]) -> Result<Args, String> {
             let action = match action.as_str() {
                 "show" => ConfigAction::Show,
                 "list" => ConfigAction::List,
+                "validate" => ConfigAction::Validate,
                 "set" => {
                     let words: Vec<String> = rest.by_ref().cloned().collect();
                     if words.is_empty() || !words.len().is_multiple_of(2) {
@@ -220,8 +300,111 @@ pub(super) fn parse(argv: &[String]) -> Result<Args, String> {
             args.command = Some(Command::Config(action));
             continue;
         }
+        if args.command.is_none() && arg == "credentials" {
+            let action = rest
+                .next()
+                .ok_or_else(|| "credentials needs an action: set, forget or status".to_string())?;
+            if matches!(action.as_str(), "-h" | "--help") {
+                args.help = true;
+                args.help_topic = Some(HelpTopic::Credentials);
+                continue;
+            }
+            let action = match action.as_str() {
+                "set" => {
+                    let mut target = Target::Auto;
+                    while let Some(next) = rest.clone().next() {
+                        let next = next.as_str();
+                        if next == "--store" {
+                            let _ = rest.next();
+                            let value = rest.next().ok_or("--store needs a value")?;
+                            target = parse_store(value)?;
+                        } else if let Some(value) = next.strip_prefix("--store=") {
+                            let _ = rest.next();
+                            target = parse_store(value)?;
+                        } else if next == "--json" {
+                            let _ = rest.next();
+                            args.json = true;
+                        } else if matches!(next, "-h" | "--help") {
+                            args.help = true;
+                            args.help_topic = Some(HelpTopic::CredentialsSet);
+                            break;
+                        } else {
+                            return Err(format!("Unexpected argument: {next}"));
+                        }
+                    }
+                    if args.help {
+                        continue;
+                    }
+                    CredentialsAction::Set(target)
+                }
+                "forget" => {
+                    let mut legacy = false;
+                    if let Some(next) = rest.clone().next() {
+                        if matches!(next.as_str(), "-h" | "--help") {
+                            let _ = rest.next();
+                            args.help = true;
+                            args.help_topic = Some(HelpTopic::CredentialsForget);
+                            continue;
+                        }
+                        if next == "--legacy" {
+                            let _ = rest.next();
+                            legacy = true;
+                        } else {
+                            return Err(format!("Unexpected argument: {next}"));
+                        }
+                    }
+                    CredentialsAction::Forget { legacy }
+                }
+                "status" => CredentialsAction::Status,
+                other => return Err(format!("Unknown credentials action: {other}")),
+            };
+            args.command = Some(Command::Credentials(action));
+            continue;
+        }
+        // The installed entry point and its worker. Both are internal: they are
+        // recognised so the native task can run this same binary, and are absent
+        // from the help text.
+        if args.command.is_none() && arg == "__worker" {
+            args.command = Some(Command::Worker);
+            continue;
+        }
+        if args.command.is_none() && arg == "__background" {
+            let mut trigger = Trigger::Interval;
+            let mut startup_delay = None;
+            while let Some(next) = rest.next() {
+                match next.as_str() {
+                    "--trigger" => {
+                        let value = rest.next().ok_or("--trigger needs a value")?;
+                        trigger = match value.as_str() {
+                            "interval" => Trigger::Interval,
+                            "startup" => Trigger::Startup,
+                            other => return Err(format!("Unknown trigger: {other}")),
+                        };
+                    }
+                    "--startup-delay-secs" => {
+                        let value = rest.next().ok_or("--startup-delay-secs needs a value")?;
+                        startup_delay = Some(
+                            value
+                                .parse::<u64>()
+                                .map_err(|_| "--startup-delay-secs needs seconds".to_string())?,
+                        );
+                    }
+                    "--control-dir" => {
+                        let value = rest.next().ok_or("--control-dir needs a path")?;
+                        args.control_dir = Some(PathBuf::from(value));
+                    }
+                    other => return Err(format!("Unexpected argument: {other}")),
+                }
+            }
+            args.command = Some(Command::Background {
+                trigger,
+                startup_delay_secs: startup_delay,
+            });
+            continue;
+        }
         match arg {
             "--help" | "-h" => args.help = true,
+            "--version" | "-V" => args.version = true,
             "--portable" => args.portable = true,
             "--config" => {
                 let value = rest
@@ -229,12 +412,25 @@ pub(super) fn parse(argv: &[String]) -> Result<Args, String> {
                     .ok_or_else(|| "--config needs a path".to_string())?;
                 args.config = Some(PathBuf::from(value));
             }
+            "--control-dir" => {
+                let value = rest
+                    .next()
+                    .ok_or_else(|| "--control-dir needs a path".to_string())?;
+                args.control_dir = Some(PathBuf::from(value));
+            }
             _ if arg.starts_with("--config=") => {
                 let value = &arg["--config=".len()..];
                 if value.is_empty() {
                     return Err("--config needs a path".to_string());
                 }
                 args.config = Some(PathBuf::from(value));
+            }
+            _ if arg.starts_with("--control-dir=") => {
+                let value = &arg["--control-dir=".len()..];
+                if value.is_empty() {
+                    return Err("--control-dir needs a path".to_string());
+                }
+                args.control_dir = Some(PathBuf::from(value));
             }
             _ if arg.starts_with('-') && arg.len() > 1 => {
                 return Err(format!("Unknown option: {arg}"));
@@ -247,29 +443,63 @@ pub(super) fn parse(argv: &[String]) -> Result<Args, String> {
             }
         }
     }
-    validate_setting_options(&args)?;
+    validate(&args)?;
     Ok(args)
 }
 
-fn validate_setting_options(args: &Args) -> Result<(), String> {
+fn parse_store(value: &str) -> Result<Target, String> {
+    match value {
+        "auto" => Ok(Target::Auto),
+        "file" => Ok(Target::File),
+        "keyring" => Ok(Target::Keyring),
+        other => Err(format!(
+            "Unknown --store value: {other} (expected auto, file or keyring)"
+        )),
+    }
+}
+
+fn validate(args: &Args) -> Result<(), String> {
+    if args.portal_url.is_some()
+        && args
+            .setting_options
+            .iter()
+            .any(|(key, _)| key == "portal_url")
+    {
+        return Err(
+            "Portal URL cannot be specified both as a positional argument and with --portal-url"
+                .to_string(),
+        );
+    }
+    let supports_json = matches!(
+        args.command,
+        Some(Command::Reconnect)
+            | Some(Command::Disconnect)
+            | Some(Command::Resume)
+            | Some(Command::Service(
+                ServiceAction::Status | ServiceAction::Logs
+            ))
+            | Some(Command::Config(ConfigAction::Show | ConfigAction::Validate))
+            | Some(Command::Credentials(CredentialsAction::Status))
+    );
+    if args.json && !supports_json {
+        return Err("--json is not supported by this command".to_string());
+    }
     if args.setting_options.is_empty() {
         return Ok(());
     }
-    if matches!(
-        args.command.as_ref(),
-        Some(Command::Service(
-            ServiceAction::Uninstall | ServiceAction::Status | ServiceAction::Forget
-        )) | Some(Command::Config(_))
+    if !matches!(
+        args.command,
+        None | Some(Command::Reconnect) | Some(Command::Service(ServiceAction::Install))
     ) {
         return Err("setting options are not valid for this command".to_string());
     }
     for (key, _) in &args.setting_options {
-        let allowed = match args.command.as_ref() {
+        let allowed = match args.command {
             None | Some(Command::Reconnect) => {
                 matches!(key.as_str(), "portal_url" | "username" | "timeout_ms")
             }
             Some(Command::Service(ServiceAction::Install)) => true,
-            Some(Command::Service(_)) | Some(Command::Config(_)) => unreachable!(),
+            _ => unreachable!("guarded above"),
         };
         if !allowed {
             let mode = if args.command.is_none() {
@@ -292,15 +522,26 @@ fn selected_help_topic(args: &Args) -> HelpTopic {
     }
     match &args.command {
         Some(Command::Reconnect) => HelpTopic::Reconnect,
+        Some(Command::Disconnect) => HelpTopic::Disconnect,
+        Some(Command::Resume) => HelpTopic::Resume,
         Some(Command::Service(ServiceAction::Install)) => HelpTopic::ServiceInstall,
         Some(Command::Service(ServiceAction::Uninstall)) => HelpTopic::ServiceUninstall,
         Some(Command::Service(ServiceAction::Status)) => HelpTopic::ServiceStatus,
-        Some(Command::Service(ServiceAction::Forget)) => HelpTopic::ServiceForget,
+        Some(Command::Service(ServiceAction::Start)) => HelpTopic::ServiceStart,
+        Some(Command::Service(ServiceAction::Stop)) => HelpTopic::ServiceStop,
+        Some(Command::Service(ServiceAction::Restart)) => HelpTopic::ServiceRestart,
+        Some(Command::Service(ServiceAction::Logs)) => HelpTopic::ServiceLogs,
         Some(Command::Config(ConfigAction::Show)) => HelpTopic::ConfigShow,
         Some(Command::Config(ConfigAction::List)) => HelpTopic::ConfigList,
         Some(Command::Config(ConfigAction::Set(_))) => HelpTopic::ConfigSet,
         Some(Command::Config(ConfigAction::Unset(_))) => HelpTopic::ConfigUnset,
-        None => HelpTopic::Global,
+        Some(Command::Config(ConfigAction::Validate)) => HelpTopic::ConfigValidate,
+        Some(Command::Credentials(CredentialsAction::Set(_))) => HelpTopic::CredentialsSet,
+        Some(Command::Credentials(CredentialsAction::Forget { .. })) => {
+            HelpTopic::CredentialsForget
+        }
+        Some(Command::Credentials(CredentialsAction::Status)) => HelpTopic::CredentialsStatus,
+        Some(Command::Background { .. }) | Some(Command::Worker) | None => HelpTopic::Global,
     }
 }
 
@@ -314,24 +555,51 @@ Check the portal connection once and log in when needed.
 This command never prompts. It requires portal_url, username, and a
 password from SRUN_PORTAL_PASSWORD or the stored credentials.
 
+A pause from `disconnect`/`service stop` is respected: reconnect reports
+`paused` and sends nothing until `resume`.
+
+Output: `--json` prints {result, error_kind, message}.
+
 Configuration overrides for this run:
   --portal-url URL              --username USERNAME[@DOMAIN]
   --timeout-ms MS
 
 Options:
   --config <path>   use exactly this configuration file
-  --portable        use the portable configuration location
+  --portable        prefer the portable configuration location
+  --json            machine-readable output
   --help, -h        print this help and exit
+"#
+        }
+        HelpTopic::Disconnect => {
+            r#"Usage: srun-portal [options] disconnect
+
+Pause the background reconnect permanently, then sign this device out of
+the portal. The pause is written before the sign-out is attempted, so a
+failed sign-out still leaves the device offline by policy.
+
+Offline is success. Undo with `srun-portal resume`.
+"#
+        }
+        HelpTopic::Resume => {
+            r#"Usage: srun-portal [options] resume
+
+Clear the pause written by `disconnect`/`service stop`, then check the
+connection immediately. A check that fails does not pause again: the next
+scheduled run reports its own result.
 "#
         }
         HelpTopic::Service => {
             r#"Usage: srun-portal [options] service <action>
 
 Actions:
-  install            validate credentials and install the task
-  uninstall          remove the task; keep stored credentials
-  status             show task and credential status
-  forget             delete stored credentials
+  install            register the background task (offline; no portal request)
+  uninstall          remove the task; keep stored credentials and history
+  status             what is installed, paused, and what the system reports
+  start              clear the pause and check now (requires an install)
+  stop               pause the task and stop a run in progress
+  restart            stop, then start
+  logs               the recent events (up to 200)
 
 Use `srun-portal service <action> --help` for action-specific help.
 Global options may precede `service`.
@@ -340,9 +608,14 @@ Global options may precede `service`.
         HelpTopic::ServiceInstall => {
             r#"Usage: srun-portal [options] service install
 
-Validate credentials and install the background reconnect task.
-When run interactively, each missing or existing setting is prompted with its
-current value as the default; press Enter to keep it.
+Register the background reconnect task for this system. This step makes no
+portal request of its own: it validates the configuration, stores a
+password if one was supplied, and registers the task. The first real check
+is the task's own next run, so `service install` succeeding says nothing
+about whether the password is correct — run `reconnect` to find out.
+
+When run interactively, each missing setting is prompted with its current
+value as the default; press Enter to keep it.
 The following action options are persisted in the selected configuration:
 
   --portal-url URL
@@ -351,64 +624,84 @@ The following action options are persisted in the selected configuration:
   --reconnect-interval-secs SECONDS
   --reconnect-boot-delay-secs SECONDS
 
-For the timeout and reconnect options, values are milliseconds or seconds:
-  --timeout-ms 10000
-  --reconnect-interval-secs 300
-  --reconnect-boot-delay-secs 30
-
 Missing portal URL and username are prompted interactively. Password input is
 never accepted as a command-line option; use SRUN_PORTAL_PASSWORD, an existing
 stored password, or the secure prompt.
 
-The command performs a login/check before writing the credential or
-installing the task.
-
 Equivalent configuration-file keys use underscores, for example:
   srun-portal config set reconnect_interval_secs 300 \
       reconnect_boot_delay_secs 30
-
-Global options:
-  --config <path>   use exactly this configuration file
-  --portable        use the portable configuration location
-  --help, -h        print this help and exit
 "#
         }
         HelpTopic::ServiceUninstall => {
             r#"Usage: srun-portal [options] service uninstall
 
-Remove the background reconnect task. Stored credentials are kept;
-use `service forget` to delete them.
+Remove the background reconnect task, its definitions and the record of the
+installation. Stored credentials, the pause state and the event history are
+kept; use `credentials forget` to delete a password.
 "#
         }
         HelpTopic::ServiceStatus => {
             r#"Usage: srun-portal [options] service status
 
-Show the effective configuration, credential source, and task state.
+Show whether the task is installed, whether it is paused, whether a run is in
+progress, the configuration files it reads, and the platform's own view of the
+task. Nothing here reads a password or contacts the portal.
+
+`--json` prints schema_version, installed, paused, installing, running,
+config_sources, requested_interval_secs, effective_interval_secs,
+boot_delay_secs, last_attempt, last_success_at_ms, platform, platform_state
+and errors.
 "#
         }
-        HelpTopic::ServiceForget => {
-            r#"Usage: srun-portal [options] service forget
+        HelpTopic::ServiceStart => {
+            r#"Usage: srun-portal [options] service start
 
-Delete the stored password from the system keyring and fallback file.
+Clear the pause and check the connection immediately. Requires an installed
+task; use `resume` when nothing is installed.
+"#
+        }
+        HelpTopic::ServiceStop => {
+            r#"Usage: srun-portal [options] service stop
+
+Pause the background task and stop a run that is in progress. The task
+definition stays registered, so the schedule resumes where it left off when
+`service start` or `resume` clears the pause.
+"#
+        }
+        HelpTopic::ServiceRestart => {
+            r#"Usage: srun-portal [options] service restart
+
+Stop (pause and terminate a run in progress), then start (clear the pause and
+check now).
+"#
+        }
+        HelpTopic::ServiceLogs => {
+            r#"Usage: srun-portal [options] service logs
+
+Print the recorded events, oldest first, at most 200. `--json` prints them as
+an array. There is no follow mode: the record is bounded on purpose.
 "#
         }
         HelpTopic::Config => {
             r#"Usage: srun-portal [options] config <action>
 
-Actions: show, list, set KEY VALUE [...], unset KEY [...]
+Actions: show, list, set KEY VALUE [...], unset KEY [...], validate
 Use `srun-portal config <action> --help` for action-specific help.
 "#
         }
         HelpTopic::ConfigShow => {
             r#"Usage: srun-portal [options] config show
 
-Show every effective configuration value.
+Show every effective configuration value and which file supplies it.
+`--json` prints {schema_version, values, sources, write_path}; `values` holds
+the raw numbers, not display strings.
 "#
         }
         HelpTopic::ConfigList => {
             r#"Usage: srun-portal [options] config list
 
-Show only keys stored in the selected configuration file.
+Show only the keys the written configuration file sets.
 "#
         }
         HelpTopic::ConfigSet => {
@@ -420,6 +713,10 @@ Set one or more configuration values:
   timeout_ms
   reconnect_interval_secs
   reconnect_boot_delay_secs
+
+The whole batch is validated before anything is written; a rejected batch
+leaves the file untouched. Changing a schedule key needs `service install`
+again to reach the native task.
 
 Examples:
   srun-portal config set username testuser@szu timeout_ms 10000
@@ -434,6 +731,60 @@ Remove one or more configuration values. Keys may use TOML names or the
 command-line form:
   srun-portal config unset timeout_ms reconnect_interval_secs
   srun-portal config unset --timeout-ms --reconnect-interval-secs
+"#
+        }
+        HelpTopic::ConfigValidate => {
+            r#"Usage: srun-portal [options] config validate
+
+Check that the effective configuration can be used: an http(s) portal URL, a
+non-empty account, a timeout between 1 and 60000 ms, an interval up to 86340 s
+and a startup delay up to 86400 s. Exit status 2 means the configuration is
+wrong.
+"#
+        }
+        HelpTopic::Credentials => {
+            r#"Usage: srun-portal [options] credentials <action>
+
+Actions:
+  set [--store auto|file|keyring]   store the password for this portal and account
+  forget [--legacy]                 delete it, or also the old unscoped entries
+  status                            where the password comes from
+
+Credentials are keyed by portal origin and account. `set` reads the password
+from SRUN_PORTAL_PASSWORD or a secure prompt; it never contacts the portal.
+"#
+        }
+        HelpTopic::CredentialsSet => {
+            r#"Usage: srun-portal [options] credentials set [--store auto|file|keyring]
+
+Store the password for the configured portal and account.
+
+  auto      the system keyring, falling back to the private file with a warning
+  file      the private file only
+  keyring   the system keyring only; a failure is an error
+
+The password comes from SRUN_PORTAL_PASSWORD or a secure prompt. No request is
+sent to the portal, so a stored password is not a verified one.
+"#
+        }
+        HelpTopic::CredentialsForget => {
+            r#"Usage: srun-portal [options] credentials forget [--legacy]
+
+Delete the stored password for the configured portal and account from both
+the keyring and the private file. Other accounts are kept.
+
+  --legacy   also delete the old unscoped entries: the keyring entry keyed by
+             the bare account, the top-level `password` of the credentials file
+             beside the configuration, and that account's pre-v2 key. Nothing
+             is migrated to a portal automatically; save the password again.
+"#
+        }
+        HelpTopic::CredentialsStatus => {
+            r#"Usage: srun-portal [options] credentials status
+
+Report where the password for the configured portal and account comes from:
+the environment, the private file, the keyring, or not at all. `--json` prints
+{state, detail?}. No secret is printed.
 "#
         }
     }
@@ -465,33 +816,30 @@ mod tests {
     }
 
     #[test]
-    fn parse_args_reads_the_config_command() {
-        let args = parse(&strings(&["config", "set", "username", "alice"])).unwrap();
-        assert_eq!(
-            args.command,
-            Some(Command::Config(ConfigAction::Set(vec![(
-                "username".to_string(),
-                "alice".to_string()
-            )])))
-        );
-        let args = parse(&strings(&["config", "unset", "--timeout-ms"])).unwrap();
-        assert_eq!(
-            args.command,
-            Some(Command::Config(ConfigAction::Unset(vec![
-                "timeout_ms".to_string()
-            ])))
-        );
-    }
-
-    #[test]
     fn parse_args_reads_the_commands() {
         assert_eq!(
             parse(&strings(&["reconnect"])).unwrap().command,
             Some(Command::Reconnect)
         );
         assert_eq!(
+            parse(&strings(&["disconnect"])).unwrap().command,
+            Some(Command::Disconnect)
+        );
+        assert_eq!(
+            parse(&strings(&["resume"])).unwrap().command,
+            Some(Command::Resume)
+        );
+        assert_eq!(
             parse(&strings(&["service", "install"])).unwrap().command,
             Some(Command::Service(ServiceAction::Install))
+        );
+        assert_eq!(
+            parse(&strings(&["service", "logs"])).unwrap().command,
+            Some(Command::Service(ServiceAction::Logs))
+        );
+        assert_eq!(
+            parse(&strings(&["config", "validate"])).unwrap().command,
+            Some(Command::Config(ConfigAction::Validate))
         );
         assert_eq!(
             parse(&strings(&["reconnect", "x"])).unwrap_err(),
@@ -501,6 +849,106 @@ mod tests {
             parse(&strings(&["service", "status", "extra"])).unwrap_err(),
             "Unexpected argument: extra"
         );
+        // The old `service forget` is gone, with no alias left behind.
+        assert_eq!(
+            parse(&strings(&["service", "forget"])).unwrap_err(),
+            "Unknown service action: forget"
+        );
+    }
+
+    #[test]
+    fn credentials_actions_parse_their_options() {
+        assert_eq!(
+            parse(&strings(&["credentials", "set"])).unwrap().command,
+            Some(Command::Credentials(CredentialsAction::Set(Target::Auto)))
+        );
+        assert_eq!(
+            parse(&strings(&["credentials", "set", "--store", "file"]))
+                .unwrap()
+                .command,
+            Some(Command::Credentials(CredentialsAction::Set(Target::File)))
+        );
+        assert_eq!(
+            parse(&strings(&["credentials", "set", "--store=keyring"]))
+                .unwrap()
+                .command,
+            Some(Command::Credentials(CredentialsAction::Set(
+                Target::Keyring
+            )))
+        );
+        assert_eq!(
+            parse(&strings(&["credentials", "forget", "--legacy"]))
+                .unwrap()
+                .command,
+            Some(Command::Credentials(CredentialsAction::Forget {
+                legacy: true
+            }))
+        );
+        assert!(parse(&strings(&["credentials", "set", "--store", "cloud"])).is_err());
+        assert!(parse(&strings(&["credentials", "frobnicate"])).is_err());
+    }
+
+    #[test]
+    fn internal_entry_points_parse() {
+        let args = parse(&strings(&[
+            "__background",
+            "--control-dir",
+            "/tmp/state",
+            "--trigger",
+            "startup",
+            "--startup-delay-secs",
+            "2",
+        ]))
+        .unwrap();
+        assert_eq!(args.control_dir, Some(PathBuf::from("/tmp/state")));
+        assert_eq!(
+            args.command,
+            Some(Command::Background {
+                trigger: Trigger::Startup,
+                startup_delay_secs: Some(2),
+            })
+        );
+        assert_eq!(
+            parse(&strings(&["__worker"])).unwrap().command,
+            Some(Command::Worker)
+        );
+        assert!(parse(&strings(&["__background", "--trigger", "minutely"])).is_err());
+    }
+
+    #[test]
+    fn json_is_only_accepted_where_it_means_something() {
+        for argv in [
+            strings(&["reconnect", "--json"]),
+            strings(&["disconnect", "--json"]),
+            strings(&["resume", "--json"]),
+            strings(&["service", "status", "--json"]),
+            strings(&["service", "logs", "--json"]),
+            strings(&["config", "show", "--json"]),
+            strings(&["config", "validate", "--json"]),
+            strings(&["credentials", "status", "--json"]),
+        ] {
+            assert!(parse(&argv).unwrap().json, "{argv:?}");
+        }
+        for argv in [
+            strings(&["service", "install", "--json"]),
+            strings(&["config", "list", "--json"]),
+            strings(&["--json", "config", "set", "username", "a"]),
+            strings(&["credentials", "set", "--json"]),
+            strings(&["--json"]),
+        ] {
+            assert_eq!(
+                parse(&argv).unwrap_err(),
+                "--json is not supported by this command",
+                "{argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn version_and_help_are_flags() {
+        assert!(parse(&strings(&["--version"])).unwrap().version);
+        assert!(parse(&strings(&["-V"])).unwrap().version);
+        assert!(parse(&strings(&["--help"])).unwrap().help);
     }
 
     #[test]
@@ -514,6 +962,21 @@ mod tests {
     }
 
     #[test]
+    fn positional_and_option_portal_urls_are_mutually_exclusive() {
+        let expected =
+            "Portal URL cannot be specified both as a positional argument and with --portal-url";
+        assert_eq!(
+            parse(&strings(&[
+                "https://positional.example/srun_portal_pc?ac_id=1",
+                "--portal-url",
+                "https://option.example/srun_portal_pc?ac_id=2",
+            ]))
+            .unwrap_err(),
+            expected
+        );
+    }
+
+    #[test]
     fn cadence_options_are_rejected_in_interactive_mode_in_any_position() {
         for argv in [
             strings(&["--reconnect-interval-secs", "60"]),
@@ -521,16 +984,6 @@ mod tests {
                 "https://h/srun_portal_pc?ac_id=1",
                 "--reconnect-interval-secs",
                 "60",
-            ]),
-            strings(&[
-                "--reconnect-boot-delay-secs",
-                "30",
-                "https://h/srun_portal_pc?ac_id=1",
-            ]),
-            strings(&[
-                "https://h/srun_portal_pc?ac_id=1",
-                "--reconnect-boot-delay-secs",
-                "30",
             ]),
         ] {
             let error = parse(&argv).unwrap_err();
@@ -557,6 +1010,14 @@ mod tests {
             "30"
         ]))
         .is_ok());
+    }
+
+    #[test]
+    fn setting_options_are_rejected_where_they_do_nothing() {
+        assert_eq!(
+            parse(&strings(&["service", "status", "--username", "alice"])).unwrap_err(),
+            "setting options are not valid for this command"
+        );
     }
 
     #[test]

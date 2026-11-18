@@ -3,227 +3,21 @@
 //! query strings the wire actually carried (SPEC §13.2's differential, with the
 //! stub reimplemented in std so the test needs no external artifacts).
 
-use std::io::{BufRead, BufReader, Write};
-use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread;
+mod support;
 
 use serde_json::json;
 use srun_portal::api;
+use srun_portal::control::Outcome as PassOutcome;
 use srun_portal::portal_config;
 use srun_portal::runtime::{Runtime, RuntimeOptions};
 use srun_portal::transport::{self, Endpoints};
-
-const CHALLENGE: &str = "0123456789abcdef0123456789abcdef";
-const IP: &str = "10.9.9.9";
-const MAC: &str = "aa:bb:cc:dd:ee:ff";
+use support::{Behaviour, Stub, IP};
 
 /// The captured login query (SPEC §13.2) for the stub's fixed inputs.
 const EXPECTED_LOGIN_QUERY: &str = "action=login&username=testuser&password=%7BMD5%7D94401f94e5f4eecf2f52ef15389fc664&os=Linux&name=linux&double_stack=0&chksum=5eaddabca3a1435c9c45e18fa255b3a61a1397e8&info=%7BSRBX1%7D1IPGZziAV7Q51Ak77DPQy%2B3T4n3fHXviay76y9%2FgGgyBNqV0INj7BUrtgOboiAMJpLywBA%2F%2F0FJkVyPJIKGZf5HZe5M7TmAEvgrt3110qKZ2oo%2FTMdrVXahgu8%2BXAUQjxegK9v%3D%3D&ac_id=1&ip=10.9.9.9&n=200&type=0&callback=jsonp";
 
-struct Stub {
-    origin: String,
-    requests: Arc<Mutex<Vec<String>>>,
-}
-
-impl Stub {
-    fn start() -> Stub {
-        Stub::start_with(true)
-    }
-
-    /// `login_marks_online = false` models a portal that accepts the login
-    /// request but never reports the session online, which is what the SPEC §8
-    /// retry path has to survive.
-    fn start_with(login_marks_online: bool) -> Stub {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
-        let addr = listener.local_addr().expect("stub addr");
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let online = Arc::new(AtomicBool::new(false));
-        let (log, state) = (Arc::clone(&requests), Arc::clone(&online));
-        thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(stream) = stream else { continue };
-                let (log, state) = (Arc::clone(&log), Arc::clone(&state));
-                thread::spawn(move || serve(stream, log, state, login_marks_online));
-            }
-        });
-        Stub {
-            origin: format!("http://{addr}"),
-            requests,
-        }
-    }
-
-    fn queries(&self) -> Vec<String> {
-        self.requests.lock().expect("log").clone()
-    }
-
-    /// The raw query of the last request to `path`, or `None` when absent.
-    fn last_query_for(&self, path: &str) -> Option<String> {
-        self.queries()
-            .into_iter()
-            .rfind(|line| line.starts_with(&format!("{path} ")))
-            .and_then(|line| line.split_once(' ').map(|(_, query)| query.to_string()))
-    }
-
-    fn queries_for(&self, path: &str) -> Vec<String> {
-        self.queries()
-            .into_iter()
-            .filter(|line| line.starts_with(&format!("{path} ")))
-            .filter_map(|line| line.split_once(' ').map(|(_, query)| query.to_string()))
-            .collect()
-    }
-}
-
-fn page() -> String {
-    let portal = json!({
-        "AuthIP": "127.0.0.1",
-        "AuthIP6": "127.0.0.1",
-        "ServiceIP": "",
-        "DoubleStackPC": false,
-        "DoubleStackMobile": false,
-        "MacAuth": false,
-        "TrafficCarry": 1024,
-        "AccountFilter": ""
-    });
-    format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>stub</title></head><body>\n\
-         <span id=\"cliVersion\">1.9.15</span>\n\
-         <span id=\"acid\">\"1\"</span>\n\
-         <span id=\"ip\">\"{IP}\"</span>\n\
-         <span id=\"nas\">\"stub-nas\"</span>\n\
-         <span id=\"mac\">\"{MAC}\"</span>\n\
-         <span id=\"lang\">\"en-US\"</span>\n\
-         <span id=\"isIPv6\">false</span>\n\
-         <span id=\"domain\">{{}}</span>\n\
-         <span id=\"portal\">{portal}</span>\n\
-         <span id=\"project\">stub</span>\n\
-         <span id=\"color\">#1976D2</span>\n\
-         <span id=\"useLogo\">false</span>\n\
-         <span id=\"showInfoList\">username,ip</span>\n\
-         </body></html>\n"
-    )
-}
-
-/// The JSONP wrapper the stub answers with: the callback name the request
-/// carried, echoed the way the real portal echoes it.
-fn jsonp(params: &std::collections::HashMap<String, String>, value: serde_json::Value) -> String {
-    let callback = params
-        .get("callback")
-        .map(String::as_str)
-        .unwrap_or("jsonp");
-    format!("{callback}({value})")
-}
-
-fn serve(
-    mut stream: TcpStream,
-    log: Arc<Mutex<Vec<String>>>,
-    online: Arc<AtomicBool>,
-    login_marks_online: bool,
-) {
-    let mut reader = BufReader::new(stream.try_clone().expect("clone"));
-    let mut request_line = String::new();
-    if reader.read_line(&mut request_line).is_err() {
-        return;
-    }
-    // Drain the rest of the request head.
-    loop {
-        let mut header = String::new();
-        match reader.read_line(&mut header) {
-            Ok(0) => break,
-            Ok(_) if header == "\r\n" || header == "\n" => break,
-            Ok(_) => {}
-            Err(_) => break,
-        }
-    }
-    let mut parts = request_line.split_whitespace();
-    let _method = parts.next().unwrap_or("");
-    let target = parts.next().unwrap_or("/");
-    let (path, query) = target.split_once('?').unwrap_or((target, ""));
-    log.lock().expect("log").push(format!("{path} {query}"));
-    let params = parse_query(query);
-
-    let body = match path {
-        "/srun_portal_pc" => page(),
-        "/cgi-bin/get_challenge" => jsonp(&params, json!({"error": "ok", "challenge": CHALLENGE})),
-        "/cgi-bin/rad_user_info" => {
-            let mut info = json!({
-                "error": if online.load(Ordering::SeqCst) { "ok" } else { "auth" },
-                "online_ip": IP,
-                "sysver": "1.9.15"
-            });
-            if online.load(Ordering::SeqCst) {
-                info["user_name"] = json!("testuser");
-                info["domain"] = json!("");
-                info["real_name"] = json!("Test User");
-                info["user_mac"] = json!(MAC);
-            }
-            jsonp(&params, info)
-        }
-        "/cgi-bin/srun_portal" => {
-            if params.get("action").map(String::as_str) == Some("login") && login_marks_online {
-                online.store(true, Ordering::SeqCst);
-            }
-            jsonp(&params, json!({"error": "ok"}))
-        }
-        "/cgi-bin/rad_user_dm" => {
-            online.store(false, Ordering::SeqCst);
-            jsonp(&params, json!({"error": "ok"}))
-        }
-        "/v2/srun_portal_message" => json!({"code": 0, "data": []}).to_string(),
-        "/v1/srun_portal_agree_new" => {
-            json!({"code": 0, "data": {"data": {"id": 1, "title": "t", "content": "c"}}})
-                .to_string()
-        }
-        _ => "not found".to_string(),
-    };
-
-    let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    let _ = stream.write_all(response.as_bytes());
-    let _ = stream.flush();
-}
-
 fn parse_query(query: &str) -> std::collections::HashMap<String, String> {
-    query
-        .split('&')
-        .filter(|pair| !pair.is_empty())
-        .map(|pair| match pair.split_once('=') {
-            Some((k, v)) => (percent_decode(k), percent_decode(v)),
-            None => (percent_decode(pair), String::new()),
-        })
-        .collect()
-}
-
-fn percent_decode(value: &str) -> String {
-    let bytes = value.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'%' if i + 2 < bytes.len() => match u8::from_str_radix(&value[i + 1..i + 3], 16) {
-                Ok(byte) => {
-                    out.push(byte);
-                    i += 3;
-                }
-                Err(_) => {
-                    out.push(bytes[i]);
-                    i += 1;
-                }
-            },
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            byte => {
-                out.push(byte);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
+    support::parse_query(query)
 }
 
 /// Drive the runtime the way the CLI does, stopping before the interactive loop.
@@ -251,7 +45,7 @@ fn authenticate(stub: &Stub) -> (Runtime, Vec<String>) {
 
 #[test]
 fn login_flow_carries_the_captured_queries() {
-    let stub = Stub::start();
+    let stub = Stub::start(Behaviour::offline());
     let (runtime, _) = authenticate(&stub);
 
     assert_eq!(
@@ -284,7 +78,7 @@ fn login_flow_carries_the_captured_queries() {
 fn configured_callback_is_used() {
     // A `callback` from the configuration file reaches every JSONP request, and
     // the stub echoes it, so the response only parses when the name matches.
-    let stub = Stub::start();
+    let stub = Stub::start(Behaviour::offline());
     let slug = format!("{}/srun_portal_pc?ac_id=1", stub.origin);
     let portal = srun_portal::config::parse_portal_url(&slug).expect("valid slug");
     let html = transport::get_text(&format!(
@@ -317,7 +111,7 @@ fn configured_callback_is_used() {
 
 #[test]
 fn sign_out_carries_the_dm_query_with_a_consistent_sign() {
-    let stub = Stub::start();
+    let stub = Stub::start(Behaviour::offline());
     let (mut runtime, _) = authenticate(&stub);
 
     runtime.sign_out().expect("sign-out succeeds");
@@ -339,7 +133,10 @@ fn rejected_credentials_are_reported_and_not_retried_by_the_library() {
     // A portal that answers the login request but never reports the session
     // online: the runtime must spend its three checks a second apart, then fail
     // with `Login failed` (SPEC §8).
-    let stub = Stub::start_with(false);
+    let stub = Stub::start(Behaviour {
+        login_marks_online: false,
+        ..Behaviour::offline()
+    });
     let slug = format!("{}/srun_portal_pc?ac_id=1", stub.origin);
     let portal = srun_portal::config::parse_portal_url(&slug).expect("valid slug");
     let html = transport::get_text(&format!(
@@ -371,7 +168,7 @@ fn rejected_credentials_are_reported_and_not_retried_by_the_library() {
 
 #[test]
 fn double_stack_authentication_runs_lv4_then_v6_serially() {
-    let stub = Stub::start();
+    let stub = Stub::start(Behaviour::offline());
     let slug = format!("{}/srun_portal_pc?ac_id=1", stub.origin);
     let portal = srun_portal::config::parse_portal_url(&slug).expect("valid slug");
     let html = transport::get_text(&format!(
@@ -421,7 +218,7 @@ fn double_stack_authentication_runs_lv4_then_v6_serially() {
 
 #[test]
 fn double_stack_sign_out_unbinds_both_stacks() {
-    let stub = Stub::start();
+    let stub = Stub::start(Behaviour::offline());
     let slug = format!("{}/srun_portal_pc?ac_id=1", stub.origin);
     let portal = srun_portal::config::parse_portal_url(&slug).expect("valid slug");
     let html = transport::get_text(&format!(
@@ -505,12 +302,12 @@ fn target(stub: &Stub) -> srun_portal::reconnect::Target {
 
 #[test]
 fn reconnect_once_logs_in_when_the_stub_is_offline() {
-    let stub = Stub::start();
+    let stub = Stub::start(Behaviour::offline());
 
     let outcome = srun_portal::reconnect::reconnect_once(&target(&stub), "testpass")
         .expect("the unattended pass succeeds");
 
-    assert_eq!(outcome, srun_portal::reconnect::Outcome::Reconnected);
+    assert_eq!(outcome, PassOutcome::Reconnected);
     // Exactly the one login the interactive flow sends, byte for byte.
     assert_eq!(stub.queries_for("/cgi-bin/get_challenge").len(), 1);
     assert_eq!(
@@ -525,14 +322,14 @@ fn reconnect_once_logs_in_when_the_stub_is_offline() {
 
 #[test]
 fn reconnect_once_leaves_an_online_session_alone() {
-    let stub = Stub::start();
+    let stub = Stub::start(Behaviour::offline());
     let (_, _) = authenticate(&stub);
     let logins = stub.queries_for("/cgi-bin/srun_portal").len();
 
     let outcome = srun_portal::reconnect::reconnect_once(&target(&stub), "testpass")
         .expect("the unattended pass succeeds");
 
-    assert_eq!(outcome, srun_portal::reconnect::Outcome::AlreadyOnline);
+    assert_eq!(outcome, PassOutcome::Online);
     assert_eq!(
         stub.queries_for("/cgi-bin/srun_portal").len(),
         logins,
@@ -544,10 +341,14 @@ fn reconnect_once_leaves_an_online_session_alone() {
 fn reconnect_once_reports_a_failed_login() {
     // The portal takes the login but never reports the session online, so the
     // SPEC §8 retry path ends in `Login failed` — rendered, not reworded.
-    let stub = Stub::start_with(false);
+    let stub = Stub::start(Behaviour {
+        login_marks_online: false,
+        ..Behaviour::offline()
+    });
 
     let err = srun_portal::reconnect::reconnect_once(&target(&stub), "testpass")
         .expect_err("the portal never reports the session online");
 
-    assert_eq!(err, "Login failed");
+    assert_eq!(err.message, "Login failed");
+    assert_eq!(err.kind, srun_portal::control::ErrorKind::Authentication);
 }
