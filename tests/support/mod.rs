@@ -43,6 +43,9 @@ pub struct Behaviour {
     /// exceeds the HTTP read timeout even though the whole response does. That
     /// is the case only the supervisor's deadline can catch.
     pub dribble: Option<Duration>,
+    /// Answer `rad_user_info` with exactly this value, JSONP-wrapped. `None`
+    /// keeps the fixture the other tests rely on.
+    pub rad_user_info_override: Option<serde_json::Value>,
 }
 
 impl Behaviour {
@@ -226,19 +229,23 @@ fn serve(
         "/srun_portal_pc" => page(),
         "/cgi-bin/get_challenge" => jsonp(&params, json!({"error": "ok", "challenge": CHALLENGE})),
         "/cgi-bin/rad_user_info" => {
-            let is_online = online.load(Ordering::SeqCst);
-            let mut info = json!({
-                "error": if is_online { "ok" } else { "auth" },
-                "online_ip": IP,
-                "sysver": "1.9.15"
-            });
-            if is_online {
-                info["user_name"] = json!("testuser");
-                info["domain"] = json!("");
-                info["real_name"] = json!("Test User");
-                info["user_mac"] = json!(MAC);
+            if let Some(value) = behaviour.rad_user_info_override.clone() {
+                jsonp(&params, value)
+            } else {
+                let is_online = online.load(Ordering::SeqCst);
+                let mut info = json!({
+                    "error": if is_online { "ok" } else { "auth" },
+                    "online_ip": IP,
+                    "sysver": "1.9.15"
+                });
+                if is_online {
+                    info["user_name"] = json!("testuser");
+                    info["domain"] = json!("");
+                    info["real_name"] = json!("Test User");
+                    info["user_mac"] = json!(MAC);
+                }
+                jsonp(&params, info)
             }
-            jsonp(&params, info)
         }
         "/cgi-bin/srun_portal" => {
             if params.get("action").map(String::as_str) == Some("login") {

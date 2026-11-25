@@ -11,7 +11,9 @@ use srun_portal::control::Outcome as PassOutcome;
 use srun_portal::portal_config;
 use srun_portal::runtime::{Runtime, RuntimeOptions};
 use srun_portal::transport::{self, Endpoints};
-use support::{Behaviour, Stub, IP};
+use support::{Behaviour, Stub, TempDir, IP};
+
+const BIN: &str = env!("CARGO_BIN_EXE_srun-portal");
 
 /// The captured login query (SPEC §13.2) for the stub's fixed inputs.
 ///
@@ -365,4 +367,300 @@ fn reconnect_once_reports_a_failed_login() {
 
     assert_eq!(err.message, "Login failed");
     assert_eq!(err.kind, srun_portal::control::ErrorKind::Authentication);
+}
+
+// ---------------------------------------------------------------------------
+// `status`: the read-only query, driven through the real binary
+// ---------------------------------------------------------------------------
+//
+// Every case starts the binary the way a GUI would: an explicit configuration,
+// a state directory that does not exist yet, no password in the environment and
+// closed stdin. The assertions are about what a GUI consumes — the exit code,
+// the one stdout line, an empty stderr — and about what the query did *not* do:
+// it writes no file and sends only its two reads.
+
+fn stderr_of(output: &std::process::Output) -> String {
+    String::from_utf8_lossy(&output.stderr).to_string()
+}
+
+fn stdout_of(output: &std::process::Output) -> String {
+    String::from_utf8_lossy(&output.stdout).to_string()
+}
+
+/// One isolated `status` run: its own configuration file, state directory and
+/// stub. `config_body` is written verbatim, so a test can pin what it read.
+struct StatusRun {
+    dir: TempDir,
+    stub: Stub,
+    config: std::path::PathBuf,
+}
+
+impl StatusRun {
+    fn new(tag: &str, behaviour: Behaviour, config_body: &str) -> StatusRun {
+        let dir = TempDir::new(tag);
+        let stub = Stub::start(behaviour);
+        let config = dir.join("config.toml");
+        std::fs::write(&config, config_body).expect("config file");
+        StatusRun { dir, stub, config }
+    }
+
+    fn state(&self) -> std::path::PathBuf {
+        self.dir.join("state")
+    }
+
+    fn run(&self, args: &[&str]) -> std::process::Output {
+        std::process::Command::new(BIN)
+            .args(args)
+            .env("SRUN_PORTAL_CONFIG", &self.config)
+            .env("SRUN_PORTAL_STATE_DIR", self.state())
+            .env_remove("SRUN_PORTAL_PASSWORD")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("the binary runs")
+    }
+
+    fn config_text(&self) -> String {
+        std::fs::read_to_string(&self.config).expect("config still readable")
+    }
+
+    /// Write a configuration that only names this stub's portal, so a case does
+    /// not have to build the body it does not care about.
+    fn point_at_stub(&self) {
+        std::fs::write(
+            &self.config,
+            format!(
+                "portal_url = \"{}/srun_portal_pc?ac_id=1\"\n",
+                self.stub.origin
+            ),
+        )
+        .expect("config file");
+    }
+}
+
+fn online_answer() -> serde_json::Value {
+    json!({
+        "error": "ok",
+        "user_name": "reader",
+        "domain": "campus",
+        "online_ip": "10.9.9.9",
+        "sum_bytes": 1_610_612_736_i64,
+        "sum_seconds": 3_661_i64,
+        "user_balance": 7_i64,
+        "products_name": "学生套餐",
+        "real_name": "not exported"
+    })
+}
+
+#[test]
+fn cli_status_online_reports_the_six_fields_and_honours_its_overrides() {
+    // The file points at a different `ac_id` and callback than the run uses, so a
+    // request that ignored the overrides would be visible in the log.
+    let run = StatusRun::new(
+        "status-online",
+        Behaviour {
+            rad_user_info_override: Some(online_answer()),
+            ..Behaviour::default()
+        },
+        "",
+    );
+    let body = format!(
+        "portal_url = \"{}/srun_portal_pc?ac_id=99\"\ncallback = \"status_cb\"\ntimeout_ms = 2000\n",
+        run.stub.origin
+    );
+    std::fs::write(&run.config, &body).expect("config file");
+    let before = run.config_text();
+
+    let override_url = format!(
+        "{}/srun_portal_success?ac_id=12&theme=proyx",
+        run.stub.origin
+    );
+    let output = run.run(&[
+        "status",
+        "--json",
+        "--portal-url",
+        &override_url,
+        "--timeout-ms",
+        "3000",
+    ]);
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr_of(&output));
+    assert_eq!(stderr_of(&output), "");
+    let text = stdout_of(&output);
+    assert_eq!(text.lines().count(), 1, "one JSON line, got {text:?}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(text.trim_end()).expect("stdout is JSON"),
+        json!({
+            "schema_version": 1,
+            "result": "online",
+            "account": {
+                "username": "reader@campus",
+                "ip": "10.9.9.9",
+                "used_flow_bytes": 1_610_612_736_i64,
+                "used_time_seconds": 3_661_i64,
+                "balance": 7,
+                "product_name": "学生套餐"
+            }
+        })
+    );
+    assert_eq!(
+        run.stub.queries(),
+        vec![
+            "/srun_portal_pc ac_id=12&theme=app".to_string(),
+            "/cgi-bin/rad_user_info ip=10.9.9.9&callback=status_cb".to_string(),
+        ]
+    );
+    assert_eq!(
+        run.config_text(),
+        before,
+        "status must not write the config"
+    );
+    assert!(
+        !run.state().exists(),
+        "status must not create the state dir"
+    );
+
+    // The same query without `--json`: the panel, and no exit prompt.
+    let output = run.run(&[
+        "status",
+        "--portal-url",
+        &override_url,
+        "--timeout-ms",
+        "3000",
+    ]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr_of(&output));
+    assert_eq!(stderr_of(&output), "");
+    let text = stdout_of(&output);
+    for expected in ["reader@campus", "1.50 GB", "1小时1分1秒", "¥ 7", "学生套餐"] {
+        assert!(text.contains(expected), "{expected} missing from {text:?}");
+    }
+    assert!(
+        !text.to_lowercase().contains("sign out"),
+        "status must not ask to sign out: {text:?}"
+    );
+    // Both runs produced the same two requests, and nothing else did.
+    assert_eq!(
+        run.stub.queries(),
+        vec![
+            "/srun_portal_pc ac_id=12&theme=app".to_string(),
+            "/cgi-bin/rad_user_info ip=10.9.9.9&callback=status_cb".to_string(),
+            "/srun_portal_pc ac_id=12&theme=app".to_string(),
+            "/cgi-bin/rad_user_info ip=10.9.9.9&callback=status_cb".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn cli_status_offline_is_a_result_and_a_bad_answer_is_a_failure() {
+    // Offline: the portal's own "not this device" answer, exit 0, no account.
+    let run = StatusRun::new(
+        "status-offline",
+        Behaviour {
+            rad_user_info_override: Some(json!({"error": "not_online_error"})),
+            ..Behaviour::default()
+        },
+        "",
+    );
+    run.point_at_stub();
+    let output = run.run(&["status", "--json"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr_of(&output));
+    assert_eq!(stderr_of(&output), "");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(stdout_of(&output).trim_end())
+            .expect("stdout is JSON"),
+        json!({"schema_version": 1, "result": "offline", "account": null})
+    );
+    assert_eq!(
+        run.stub.queries(),
+        vec![
+            "/srun_portal_pc ac_id=1&theme=app".to_string(),
+            "/cgi-bin/rad_user_info ip=10.9.9.9&callback=jsonp".to_string(),
+        ]
+    );
+    assert!(!run.state().exists());
+
+    // Any other answer is a failed query, not an offline device: exit 4, no
+    // stdout, a diagnostic on stderr.
+    for answer in [json!({"error": "database_unavailable"}), json!({})] {
+        let run = StatusRun::new(
+            "status-failure",
+            Behaviour {
+                rad_user_info_override: Some(answer.clone()),
+                ..Behaviour::default()
+            },
+            "",
+        );
+        run.point_at_stub();
+        let output = run.run(&["status", "--json"]);
+        assert_eq!(
+            output.status.code(),
+            Some(4),
+            "{answer} should fail: {}",
+            stderr_of(&output)
+        );
+        assert_eq!(stdout_of(&output), "", "{answer} must print nothing");
+        assert!(
+            !stderr_of(&output).is_empty(),
+            "{answer} needs a diagnostic"
+        );
+        assert_eq!(
+            run.stub.queries(),
+            vec![
+                "/srun_portal_pc ac_id=1&theme=app".to_string(),
+                "/cgi-bin/rad_user_info ip=10.9.9.9&callback=jsonp".to_string(),
+            ],
+            "{answer}"
+        );
+        assert!(!run.state().exists(), "{answer}");
+    }
+}
+
+#[test]
+fn cli_status_rejects_bad_options_before_any_request() {
+    // A configuration path that does not exist and no URL on the command line:
+    // nothing to query, so exit 2 and no request.
+    let dir = TempDir::new("status-noconfig");
+    let missing = dir.join("absent.toml");
+    let state = dir.join("state");
+    let output = std::process::Command::new(BIN)
+        .args(["status", "--json"])
+        .env("SRUN_PORTAL_CONFIG", &missing)
+        .env("SRUN_PORTAL_STATE_DIR", &state)
+        .env_remove("SRUN_PORTAL_PASSWORD")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("the binary runs");
+    assert_eq!(output.status.code(), Some(2), "{}", stderr_of(&output));
+    assert_eq!(stdout_of(&output), "");
+    assert!(
+        stderr_of(&output).contains(srun_portal::messages::PORTAL_URL_REQUIRED),
+        "{}",
+        stderr_of(&output)
+    );
+    assert!(
+        !missing.exists(),
+        "status must not create the configuration"
+    );
+    assert!(!state.exists(), "status must not create the state dir");
+
+    // A URL that resolves, with a timeout the configuration rule rejects: the
+    // run stops at validation, before the portal sees anything.
+    let run = StatusRun::new("status-timeout", Behaviour::default(), "");
+    run.point_at_stub();
+    let output = run.run(&[
+        "status",
+        "--json",
+        "--portal-url",
+        &format!("{}/srun_portal_pc?ac_id=1", run.stub.origin),
+        "--timeout-ms",
+        "0",
+    ]);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr_of(&output));
+    assert_eq!(stdout_of(&output), "");
+    assert!(
+        stderr_of(&output).contains("timeout_ms"),
+        "{}",
+        stderr_of(&output)
+    );
+    assert_eq!(run.stub.request_count(), 0, "no request may be sent");
+    assert!(!run.state().exists());
 }
