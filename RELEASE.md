@@ -2,7 +2,7 @@
 
 ## 当前版本线
 
-仓库当前版本为 `0.1.0`；最低 Rust 版本为 **1.89**（`File::lock` 的稳定版本）。
+仓库当前版本为 `0.2.0`；最低 Rust 版本为 **1.89**（`File::lock` 的稳定版本）。
 
 在 `1.0.0` 之前，小版本可以包含为适配新 Portal 变体所需的 API 或行为调整；
 补丁版本应保持兼容，主要用于修复、验证更新和文档更新。
@@ -28,9 +28,9 @@ cargo build --release
 发布包中的二进制建议按版本和目标命名：
 
 ```text
-srun-portal-v0.1.0-x86_64-unknown-linux-gnu
-srun-portal-v0.1.0-x86_64-apple-darwin
-srun-portal-v0.1.0-x86_64-pc-windows-msvc.exe
+srun-portal-v0.2.0-x86_64-unknown-linux-gnu
+srun-portal-v0.2.0-x86_64-apple-darwin
+srun-portal-v0.2.0-x86_64-pc-windows-msvc.exe
 ```
 
 每个二进制旁应提供 SHA-256 校验值。仓库 CI 验证三个目标的构建与隔离回归；
@@ -67,8 +67,8 @@ srun-portal reconnect                # 真正验证凭据
 生成 SHA-256 文件，然后使用 `GITHUB_TOKEN` 创建 GitHub Release 并上传产物。
 
 ```text
-git tag -a v0.1.0 -m "srun-portal v0.1.0"
-git push origin v0.1.0
+git tag -a v0.2.0 -m "srun-portal v0.2.0"
+git push origin v0.2.0
 ```
 
 ## 升级
