@@ -416,8 +416,8 @@ fn a_paused_schedule_sends_nothing_and_keeps_the_last_verdict() {
         after_disconnect > requests,
         "the sign-out did reach the portal"
     );
-    // A sign-out is itself a network conclusion, so it is the new last success.
-    let success = harness.health()["last_success_at_ms"].clone();
+    let last_attempt = harness.health();
+    assert_eq!(last_attempt["result"], "disconnected");
 
     for _ in 0..2 {
         let output = harness.run_with_password(
@@ -438,12 +438,11 @@ fn a_paused_schedule_sends_nothing_and_keeps_the_last_verdict() {
         after_disconnect,
         "a paused background run sends nothing"
     );
-    let health = harness.health();
     assert_eq!(
-        health["last_success_at_ms"], success,
-        "a paused run does not overwrite the last success"
+        harness.health(),
+        last_attempt,
+        "a paused background run does not overwrite the last network result"
     );
-    assert_ne!(health["result"], "failed");
 }
 
 #[test]
@@ -452,11 +451,13 @@ fn resume_clears_the_pause_and_checks_immediately() {
     harness.record_installation();
     let output = harness.run_with_password(&["disconnect"], "testpass");
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let last_attempt = harness.health();
 
     // A fresh process sees the pause.
     let paused = harness.run_with_password(&["reconnect", "--json"], "testpass");
     let body: Value = serde_json::from_str(stdout(&paused).trim()).expect("JSON result");
     assert_eq!(body["result"], "paused");
+    assert_eq!(harness.health(), last_attempt);
     let requests = harness.stub.request_count();
 
     let output = harness.run_with_password(&["resume", "--json"], "testpass");
@@ -718,14 +719,15 @@ fn service_logs_show_the_recorded_events_in_order() {
     let harness = Harness::new("logs", Behaviour::offline());
     harness.run_with_password(&["reconnect"], "testpass");
     harness.run_with_password(&["disconnect"], "testpass");
+    harness.run_with_password(&["reconnect"], "testpass");
 
     let output = harness.run(&["service", "logs", "--json"]);
     assert!(output.status.success(), "{}", stderr(&output));
     let events: Vec<Value> = serde_json::from_str(stdout(&output).trim()).expect("JSON array");
-    assert!(events.len() >= 2, "{events:?}");
+    assert_eq!(events.len(), 3, "{events:?}");
     assert_eq!(events[0]["result"], "reconnected");
-    let last = events.last().unwrap();
-    assert_eq!(last["result"], "disconnected", "{events:?}");
+    assert_eq!(events[1]["result"], "disconnected", "{events:?}");
+    assert_eq!(events[2]["result"], "paused", "{events:?}");
     for event in &events {
         assert_eq!(event["schema_version"], 1);
         assert!(event["finished_at_ms"].as_u64().unwrap() > 0);
@@ -736,7 +738,8 @@ fn service_logs_show_the_recorded_events_in_order() {
     let text = stdout(&output);
     let lines: Vec<&str> = text.lines().collect();
     assert!(lines[0].contains("reconnected"), "{text}");
-    assert!(lines.last().unwrap().contains("disconnected"), "{text}");
+    assert!(lines[1].contains("disconnected"), "{text}");
+    assert!(lines[2].contains("paused"), "{text}");
     assert!(!text.contains("testpass"));
 }
 
@@ -912,6 +915,12 @@ fn stop_pauses_even_with_nothing_installed() {
     let body: Value = serde_json::from_str(stdout(&output).trim()).expect("JSON result");
     assert_eq!(body["result"], "paused");
     assert_eq!(harness.stub.request_count(), requests);
+
+    let status = harness.run(&["service", "status", "--json"]);
+    assert!(status.status.success(), "{}", stderr(&status));
+    let body: Value = serde_json::from_slice(&status.stdout).expect("JSON status");
+    assert_eq!(body["paused"], true);
+    assert_eq!(body["last_attempt"], Value::Null);
 }
 
 #[test]

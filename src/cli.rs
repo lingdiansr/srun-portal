@@ -288,17 +288,16 @@ fn finish(control: &ControlDir, report: &OutcomeReport, json: bool, started_at_m
     }
     // A pause or a busy result says nothing about the network, so it must not
     // overwrite the last real verdict.
-    let health = Health {
-        schema_version: 1,
-        started_at_ms: started,
-        finished_at_ms: finished,
-        result: report.result,
-        error_kind: report.error_kind,
-        message: report.message.clone(),
-        last_success_at_ms: None,
-    };
-    if report.result != Outcome::Busy {
-        if let Err(err) = control.record_health(health) {
+    if !matches!(report.result, Outcome::Paused | Outcome::Busy) {
+        if let Err(err) = control.record_health(Health {
+            schema_version: 1,
+            started_at_ms: started,
+            finished_at_ms: finished,
+            result: report.result,
+            error_kind: report.error_kind,
+            message: report.message.clone(),
+            last_success_at_ms: None,
+        }) {
             eprintln!("{err}");
         }
     }

@@ -100,7 +100,7 @@ srun-portal config validate [--json]
 |---|---|
 | `installed.toml` | 安装记录：可执行文件、配置来源、请求周期、原生实际周期、启动延迟、所有者（Unix uid / Windows 令牌 SID） |
 | `control.toml` | `version`、`paused`、`installing` |
-| `health.json` | 最近一次完成的结果，以及最近一次成功的时间 |
+| `health.json` | 最近一次网络操作的结果，以及最近一次成功的时间 |
 | `events.json` | 最近 200 条事件 |
 | `credentials.toml` | 文件回退的密码条目 |
 | `operation.lock` | 任何可能与 Portal 通信的运行都持有的锁 |
@@ -122,10 +122,11 @@ srun-portal config validate [--json]
 }
 ```
 
-`result` 取 `online | reconnected | disconnected | paused | busy | failed`；事件额外允许
-`installed | uninstalled | resumed | stopped | install_failed`。`error_kind` 为 `null` 或
-`config | credentials | network | authentication | protocol | timeout | platform`。
-时间均为 UTC Unix 毫秒。`paused` 与 `busy` 不覆盖最近一次网络结论。
+`health.json` 的 `result` 取 `online | reconnected | disconnected | failed`。事件额外允许
+`paused | busy | installed | uninstalled | resumed | stopped | install_failed`。
+`error_kind` 为 `null` 或 `config | credentials | network | authentication | protocol |
+timeout | platform`。时间均为 UTC Unix 毫秒。`paused` 与 `busy` 不覆盖最近一次网络结果；
+后台入口若启动时已经暂停，则直接退出，不追加事件。
 
 “正在运行”由 `operation.lock` 是否被持有判断，不依赖持久 PID。文件缺失表示默认值
 （未安装、未暂停、无历史）；存在但无法解析是明确错误，不会被静默重置。

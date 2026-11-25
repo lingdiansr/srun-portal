@@ -510,21 +510,6 @@ mod tests {
     }
 
     #[test]
-    fn busy_and_paused_do_not_rewrite_the_network_verdict() {
-        let dir = TempDir::new("busy");
-        let control = control(&dir);
-        control
-            .record_health(health(Outcome::Online, 1_000))
-            .unwrap();
-        let paused = control
-            .record_health(health(Outcome::Paused, 2_000))
-            .unwrap();
-        assert_eq!(paused.result, Outcome::Paused);
-        assert!(!paused.result.is_network_health());
-        assert_eq!(paused.last_success_at_ms, Some(1_000));
-    }
-
-    #[test]
     fn events_are_bounded_and_ordered() {
         let dir = TempDir::new("events");
         let control = control(&dir);
