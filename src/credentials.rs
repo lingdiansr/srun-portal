@@ -283,11 +283,20 @@ fn revoke_with(backend: &dyn Backend, key: &str, path: &Path) -> Result<bool, St
 }
 
 /// Inspect both backends for `key` without returning any secret.
-pub fn status(key: &str, path: &Path) -> Result<Status, ConfigError> {
-    status_with(&SystemBackend, key, path)
+///
+/// `account` is the bare qualified account, which is what the pre-v2 code filed
+/// the wallet entry under; it is probed only after `key` misses, so an entry
+/// this version can actually use always wins.
+pub fn status(key: &str, account: &str, path: &Path) -> Result<Status, ConfigError> {
+    status_with(&SystemBackend, key, account, path)
 }
 
-fn status_with(backend: &dyn Backend, key: &str, path: &Path) -> Result<Status, ConfigError> {
+fn status_with(
+    backend: &dyn Backend,
+    key: &str,
+    account: &str,
+    path: &Path,
+) -> Result<Status, ConfigError> {
     let guard = FileLock::acquire(path)
         .map_err(|err| ConfigError::Io(format!("{}: {err}", path.display())))?;
     let file = inspect_file(key, path);
@@ -303,7 +312,20 @@ fn status_with(backend: &dyn Backend, key: &str, path: &Path) -> Result<Status, 
         }
     }
     match backend.read(key) {
-        Ok(Some(_)) => Ok(Status::Keyring),
+        Ok(Some(_)) => return Ok(Status::Keyring),
+        Ok(None) => {}
+        Err(err) => {
+            return Ok(Status::Unavailable {
+                detail: format!("keyring: {err}"),
+            })
+        }
+    }
+    // The wallet is reachable and has no entry this version can use. An entry
+    // under the bare account is what an install before v2 keys wrote, and it is
+    // reported rather than hidden as "missing": the password exists, it is only
+    // unbound, and `credentials forget --legacy` is the documented way out.
+    match backend.read(account) {
+        Ok(Some(_)) => Ok(Status::LegacyUnscoped),
         Ok(None) => Ok(Status::Missing),
         Err(err) => Ok(Status::Unavailable {
             detail: format!("keyring: {err}"),
@@ -724,7 +746,7 @@ mod tests {
         let key = "v2:https%3A%2F%2Fh:alice";
 
         assert_eq!(resolve(key, &path, None).unwrap(), None);
-        assert_eq!(status(key, &path).unwrap(), Status::LegacyUnscoped);
+        assert_eq!(status(key, "alice", &path).unwrap(), Status::LegacyUnscoped);
 
         // Writing a v2 entry into that file is refused rather than producing a
         // shape the reader rejects.
@@ -846,7 +868,7 @@ mod tests {
                 "{err}"
             );
             assert!(matches!(
-                status("v2:x", &path).unwrap(),
+                status("v2:x", "alice", &path).unwrap(),
                 Status::Unavailable { .. }
             ));
         }
@@ -1003,7 +1025,7 @@ mod tests {
             ..Fake::default()
         };
         assert_eq!(
-            status_with(&backend, "v2:https%3A%2F%2Fh:alice", &path).unwrap(),
+            status_with(&backend, "v2:https%3A%2F%2Fh:alice", "alice", &path).unwrap(),
             Status::Unavailable {
                 detail: "keyring: no session bus".to_string()
             }
@@ -1011,7 +1033,7 @@ mod tests {
         // A file entry still answers even when the facility cannot be read.
         store("v2:https%3A%2F%2Fh:alice", "on-disk", &path, Target::File).unwrap();
         assert_eq!(
-            status_with(&backend, "v2:https%3A%2F%2Fh:alice", &path).unwrap(),
+            status_with(&backend, "v2:https%3A%2F%2Fh:alice", "alice", &path).unwrap(),
             Status::File
         );
         assert_eq!(
@@ -1027,9 +1049,60 @@ mod tests {
         let dir = TempDir::new("status");
         let path = dir.file();
         let key = "v2:https%3A%2F%2Fh:alice";
-        assert_eq!(status(key, &path).unwrap(), Status::Missing);
+        assert_eq!(status(key, "alice", &path).unwrap(), Status::Missing);
         store(key, "secret", &path, Target::File).unwrap();
-        assert_eq!(status(key, &path).unwrap(), Status::File);
+        assert_eq!(status(key, "alice", &path).unwrap(), Status::File);
+    }
+
+    #[test]
+    fn a_bare_keyring_entry_from_before_v2_is_reported_not_hidden() {
+        use std::collections::HashMap;
+
+        /// A facility that files each entry under its own key, like the real
+        /// one does; `Fake` holds a single value and cannot tell two keys apart.
+        struct Wallet(HashMap<String, String>);
+
+        impl Backend for Wallet {
+            fn store(&self, _key: &str, _password: &str) -> Result<(), String> {
+                unreachable!("status never stores")
+            }
+            fn read(&self, key: &str) -> Result<Option<String>, String> {
+                Ok(self.0.get(key).cloned())
+            }
+            fn delete(&self, _key: &str) -> Result<bool, String> {
+                unreachable!("status never deletes")
+            }
+        }
+
+        let dir = TempDir::new("legacy-keyring");
+        let path = dir.file();
+        let key = "v2:https%3A%2F%2Fh:alice%40staff";
+
+        // What an install before v2 keys left in the wallet: the bare account,
+        // holding a real password the current key never looks at.
+        let backend = Wallet(HashMap::from([(
+            "alice@staff".to_string(),
+            "real-password".to_string(),
+        )]));
+
+        assert_eq!(
+            status_with(&backend, key, "alice@staff", &path).unwrap(),
+            Status::LegacyUnscoped,
+            "the password exists, so the answer must not be Missing"
+        );
+        // It is not usable for authentication either.
+        assert_eq!(
+            resolve_with(&backend, key, &path, None).unwrap(),
+            None,
+            "an unbound entry is never bound automatically"
+        );
+
+        // A v2 entry under the same account wins over the bare one.
+        store(key, "current", &path, Target::File).unwrap();
+        assert_eq!(
+            status_with(&backend, key, "alice@staff", &path).unwrap(),
+            Status::File
+        );
     }
 
     #[test]

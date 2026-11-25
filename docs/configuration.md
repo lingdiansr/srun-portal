@@ -280,7 +280,10 @@ srun-portal credentials status [--json]
   `[passwords]` 键。其他账号键与 v2 键都会保留。
 
 旧版条目**不会**被自动绑定到任何 Portal：`credentials status` 报告
-`legacy_unscoped`，提示清理后重新保存。存在顶层 `password` 时 `credentials set` 明确
+`legacy_unscoped`，提示清理后重新保存。这一检测覆盖两个后端——旧版文件里的顶层
+`password`／裸账号 `[passwords]` 键，以及**钥匙串中以裸账号存的那条**（v2 之前
+`service install` 写入的位置）。v2 键命中时优先报告 `keyring`／`file`，旧条目只在
+v2 键未命中时才被报告。存在顶层 `password` 时 `credentials set` 明确
 报错 `Legacy unscoped credential file; run credentials forget --legacy first.`，避免产生
 读取器拒绝的混合格式。
 

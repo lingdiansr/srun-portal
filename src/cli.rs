@@ -785,7 +785,7 @@ fn run_credentials(action: CredentialsAction, args: &Args) -> i32 {
         },
         CredentialsAction::Forget { legacy: true } => unreachable!("handled above"),
         CredentialsAction::Status => {
-            let status = match credentials::status(&key, &path) {
+            let status = match credentials::status(&key, account.qualified(), &path) {
                 Ok(status) => status,
                 Err(err) => {
                     eprintln!("{err}");
