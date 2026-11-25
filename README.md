@@ -30,7 +30,7 @@ cargo test --all-targets
 
 ```text
 srun-portal [options] [portal-url]
-srun-portal [options] reconnect | disconnect | resume
+srun-portal [options] reconnect | status | disconnect | resume
 srun-portal [options] service install|uninstall|status|start|stop|restart|logs
 srun-portal [options] config show|list|set|unset|validate
 srun-portal [options] credentials set|forget|status
@@ -39,6 +39,7 @@ srun-portal [options] credentials set|forget|status
 | 命令 | 作用 |
 |---|---|
 | `reconnect` | 检查当前在线状态，仅在需要时登录一次 |
+| `status` | 只读查询：在线/离线与六项账户字段；不登录、不写配置、不读密码 |
 | `disconnect` | 先持久暂停后台重连接，再登出（离线视为成功） |
 | `resume` | 解除暂停并立即检查 |
 | `service install` | 注册后台重连接任务；**不访问 Portal**、不验证密码 |
@@ -60,12 +61,18 @@ srun-portal [options] credentials set|forget|status
 - `--config <path>`：只使用指定配置文件；只有初始化命令会创建它。
 - `--portable`：首次创建配置时，放在可执行文件旁边。
 - `--json`：`config show|validate`、`credentials status`、`service status|logs`、
-  `reconnect|disconnect|resume` 的机器可读输出。
+  `reconnect|status|disconnect|resume` 的机器可读输出。
 - `--version` / `-V`：版本。
 - `--help` / `-h`：帮助。
 
 退出码：`0` 成功 / 未安装 / 已暂停 / 忙；`2` 参数或配置错误；`3` 凭据、平台或
 持久化错误；`4` 网络、认证、协议或任务总期限失败。
+
+`status` 供 GUI 调用：`--json` 时 stdout 只有一行
+`{schema_version, result, account}`，在线/离线都以 `0` 退出、stderr 为空；
+查询失败退出 `4`、stdout 为空。字段为 `username`、`ip`、`used_flow_bytes`（字节）、
+`used_time_seconds`（秒）、`balance`（面板的 ¥ 数值，不换算）、`product_name`。
+它只发配置页和一次 `rad_user_info`，不申请操作锁，也不受后台暂停影响。
 
 ## 配置与后台任务
 
