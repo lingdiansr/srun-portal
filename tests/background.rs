@@ -650,14 +650,25 @@ fn credentials_are_keyed_by_portal_and_account() {
         .output()
         .expect("credentials status runs");
     let body: Value = serde_json::from_str(stdout(&status).trim()).expect("JSON output");
-    assert_eq!(body["state"], "missing", "{body}");
+    // Another portal finds nothing for this account. Without a wallet on the
+    // host the answer is `unavailable` rather than `missing` — both say the
+    // password stored for `one.example` is not reachable from `two.example`.
+    assert!(
+        matches!(body["state"].as_str(), Some("missing" | "unavailable")),
+        "{body}"
+    );
 
-    // Forget removes it, and forgetting again is a success.
+    // Forget removes it, and forgetting again is a success — unless the host has
+    // no usable wallet. `forget` tries both stores and reports a failure for the
+    // whole operation if either fails (documented under `forget`), so the two
+    // outcomes are told apart by what the run itself reports rather than by a
+    // guess about the host.
     std::fs::write(
         &config,
         "portal_url = \"https://one.example/srun_portal_pc?ac_id=1\"\nusername = \"testuser\"\n",
     )
     .unwrap();
+    let mut wallet_ready: Option<bool> = None;
     for expected in ["Removed", "No stored"] {
         let output = Command::new(BIN)
             .args(["credentials", "forget"])
@@ -665,8 +676,18 @@ fn credentials_are_keyed_by_portal_and_account() {
             .env("SRUN_PORTAL_CONFIG", &config)
             .output()
             .expect("credentials forget runs");
-        assert!(output.status.success(), "{}", stderr(&output));
-        assert!(stdout(&output).contains(expected), "{}", stdout(&output));
+        let ready = *wallet_ready.get_or_insert_with(|| output.status.success());
+        if ready {
+            assert!(output.status.success(), "{}", stderr(&output));
+            assert!(stdout(&output).contains(expected), "{}", stdout(&output));
+        } else {
+            assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+            assert!(
+                stderr(&output).contains("keyring"),
+                "the failure names the store: {}",
+                stderr(&output)
+            );
+        }
     }
 }
 
