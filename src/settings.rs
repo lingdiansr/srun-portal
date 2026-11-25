@@ -1630,10 +1630,15 @@ mod tests {
     #[test]
     fn system_path_uses_the_convention_dir() {
         let path = system_config_path().unwrap();
+        // `directories` puts config under `.../srun-portal` on Linux and macOS
+        // and under `.../srun-portal/config` on Windows (see the doc comment on
+        // `system_config_path`), so the directory itself is what is asserted.
         assert!(
-            path.ends_with(Path::new("srun-portal").join(CONFIG_FILE_NAME)),
+            path.components()
+                .any(|component| component.as_os_str() == "srun-portal"),
             "{path:?}"
         );
+        assert!(path.ends_with(CONFIG_FILE_NAME), "{path:?}");
         assert_eq!(
             portable_config_path().unwrap(),
             sys::exe_dir().unwrap().join(CONFIG_FILE_NAME)

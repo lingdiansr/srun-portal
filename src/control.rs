@@ -599,13 +599,14 @@ mod tests {
 
     #[test]
     fn explicit_and_environment_directories_win() {
-        let explicit = PathBuf::from("/tmp/explicit-state");
+        let dir = TempDir::new("dirs-win");
+        let explicit = dir.path.join("explicit-state");
         assert_eq!(
             ControlDir::resolve(Some(&explicit)).unwrap().path(),
             explicit.as_path()
         );
 
-        let env = PathBuf::from("/tmp/env-state");
+        let env = dir.path.join("env-state");
         // Set and cleared inside the test: no other test reads this variable.
         std::env::set_var(ENV_STATE_DIR, &env);
         let resolved = ControlDir::resolve(None).unwrap();

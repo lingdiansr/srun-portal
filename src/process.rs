@@ -482,6 +482,15 @@ mod platform {
 
         let application = OsString::from(&argv[0]);
         let application = wide(&application.to_string_lossy());
+        // A bare name has to go through `CreateProcessW`'s own search: passing
+        // it as `lpApplicationName` skips PATH entirely and fails with "cannot
+        // find the file". Unix resolves such a name through `PATH` in `execvp`,
+        // so doing the same here keeps one supervisor behaviour on both sides.
+        let application_ptr: *const u16 = if argv[0].contains('\\') || argv[0].contains('/') {
+            application.as_ptr()
+        } else {
+            ptr::null()
+        };
         let mut command_line = command_line(argv).encode_utf16().collect::<Vec<u16>>();
         command_line.push(0);
 
@@ -495,7 +504,7 @@ mod platform {
 
         let created = unsafe {
             CreateProcessW(
-                application.as_ptr(),
+                application_ptr,
                 command_line.as_mut_ptr(),
                 ptr::null_mut(),
                 ptr::null_mut(),
@@ -709,10 +718,24 @@ mod tests {
     #[test]
     fn stdin_is_written_and_closed() {
         #[cfg(unix)]
-        let parts = ["/bin/sh", "-c", "cat"];
+        let (program, args) = (
+            "/bin/sh".to_string(),
+            vec!["-c".to_string(), "cat".to_string()],
+        );
+        // `COMSPEC` is the shell's absolute path, so this test does not depend
+        // on name resolution; `findstr /R "^"` matches every line, i.e. it
+        // copies stdin to stdout like `cat`.
         #[cfg(windows)]
-        let parts = ["cmd.exe", "/C", "more"];
-        let run = run(&argv(&parts), Some(b"payload\n"), Duration::from_secs(10)).unwrap();
+        let (program, args) = (
+            std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string()),
+            ["/C", "findstr", "/R", "^"]
+                .iter()
+                .map(|part| (*part).to_string())
+                .collect::<Vec<_>>(),
+        );
+        let mut argv = vec![program];
+        argv.extend(args);
+        let run = run(&argv, Some(b"payload\n"), Duration::from_secs(10)).unwrap();
         assert!(run.succeeded(), "{:?}", run.stop);
         assert_eq!(run.stdout_text(), "payload");
     }

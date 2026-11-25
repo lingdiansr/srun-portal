@@ -1490,11 +1490,14 @@ pub fn current_user() -> String {
 /// Whether `exe` looks like a build artefact, which the task would then depend
 /// on: a `target/` directory is the cargo one, and it is transient.
 pub fn note_for_executable(exe: &Path) -> Option<String> {
-    let sep = std::path::MAIN_SEPARATOR;
+    // A path can arrive with either separator: a user pasting a Unix path on
+    // Windows, or the reverse in a log. The component check is separator-aware
+    // already; this makes the textual one agree with it.
+    let text = exe.to_string_lossy();
     let is_build_dir = exe
         .components()
         .any(|component| component.as_os_str() == "target")
-        && exe.to_string_lossy().contains(&format!("{sep}target{sep}"));
+        && (text.contains("/target/") || text.contains("\\target\\"));
     if !is_build_dir {
         return None;
     }
@@ -1520,6 +1523,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_plan_runs_the_hidden_entry_point_with_the_control_directory() {
         let spec = spec();
@@ -1540,6 +1544,7 @@ mod tests {
             .any(|path| path.ends_with("srun-portal.service")));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_missing_trigger_removes_the_old_definition() {
         let mut manual = spec();
@@ -1767,16 +1772,19 @@ mod tests {
 
     #[test]
     fn a_bad_command_fails_the_install_and_keeps_the_log() {
+        // A program that does not exist, so the failure is the same on every
+        // platform and does not depend on a shell being present.
+        let missing = if cfg!(windows) {
+            "srun-portal-test-no-such-command.exe"
+        } else {
+            "srun-portal-test-no-such-command"
+        };
         let plan = Plan {
-            activate: vec![CommandSpec::new(vec!["/bin/false".to_string()])],
+            activate: vec![CommandSpec::new(vec![missing.to_string()])],
             ..Plan::default()
         };
         let failure = install(&plan).unwrap_err();
-        assert!(
-            failure.error.contains("/bin/false failed"),
-            "{}",
-            failure.error
-        );
+        assert!(failure.error.contains(missing), "{}", failure.error);
     }
 
     #[cfg(target_os = "linux")]
