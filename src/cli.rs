@@ -72,6 +72,7 @@ pub fn run(argv: Vec<String>) -> i32 {
 
     match &args.command {
         Some(Command::Reconnect) => return run_reconnect(&args, Operation::Reconnect),
+        Some(Command::Status) => return run_status(&args),
         Some(Command::Disconnect) => return run_disconnect(&args),
         Some(Command::Resume) => return run_reconnect(&args, Operation::Resume),
         Some(Command::Service(action)) => return run_service(*action, &args),
@@ -232,6 +233,179 @@ fn run_disconnect(args: &Args) -> i32 {
         drain: true,
     });
     finish(&control, &report, args.json, started)
+}
+
+// ---------------------------------------------------------------------------
+// `status`: the read-only query a GUI drives
+// ---------------------------------------------------------------------------
+
+/// `status`: report this device's current session, touching nothing.
+///
+/// The one property that shapes this function: it is a *query*. It reads the
+/// merged configuration, fetches the configuration page, and asks
+/// `rad_user_info` about this machine's address exactly once. It takes no
+/// operation lock, writes no configuration, reads no credential, control
+/// directory or pause state, and never logs in or out — so it also never waits
+/// behind a background run.
+fn run_status(args: &Args) -> i32 {
+    let resolution = match load_resolution(args) {
+        Ok(resolution) => resolution,
+        Err(status) => return status,
+    };
+    let effective = resolution.effective();
+
+    // `--portal-url` and `--timeout-ms` override this run only. The parser keeps
+    // them in order, so the last one given wins, exactly as `reconnect` behaves.
+    let slug = last_setting_option(args, "portal_url")
+        .map(str::to_string)
+        .or_else(|| effective.portal_url.clone());
+    let Some(slug) = slug else {
+        eprintln!("{}", crate::messages::PORTAL_URL_REQUIRED);
+        return 2;
+    };
+    let portal = match settings::parse_http_portal_url(&slug) {
+        Ok(portal) => portal,
+        Err(err) => {
+            eprintln!("{err}");
+            return 2;
+        }
+    };
+    let mut run_timeouts = effective.timeouts;
+    if let Some(raw) = last_setting_option(args, "timeout_ms") {
+        // The parser already rejected anything that is not a non-negative
+        // integer; the range check is the same one `config validate` applies.
+        let Ok(ms) = raw.parse::<u64>() else {
+            eprintln!("--timeout-ms {raw}: not a number of milliseconds");
+            return 2;
+        };
+        run_timeouts = transport::Timeouts {
+            connect_ms: ms,
+            read_ms: ms,
+        };
+    }
+    if let Err(err) = settings::validate_timeouts(run_timeouts) {
+        eprintln!("{err}");
+        return 2;
+    }
+    // One-shot, before the first request: the agent reads these when built.
+    let _ = transport::set_timeouts(run_timeouts);
+
+    let cfg = match fetch_config(&portal) {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            eprintln!("{}", err.render(&crate::translate::Translate::default()));
+            return 4;
+        }
+    };
+    let mut options = RuntimeOptions::from_config(&cfg, &portal.origin, &host_of(&portal.origin));
+    options.callback = effective.callback.clone();
+    let mut runtime = Runtime::new(options);
+    // Same correction the interactive panel makes; the other-stack probe is not
+    // started, because this command asks about one address and never uses the
+    // second one.
+    runtime.apply_interface_correction(&sys::network_interfaces(), &cfg.ip);
+
+    if let Err(err) = runtime.get_user_info(None) {
+        eprintln!("{}", err.render(&runtime.translate));
+        return 4;
+    }
+
+    // Strict dispatch: only the two answers the portal documents carry meaning
+    // about this device. Everything else is a failed query, not a device state —
+    // `Runtime::check_online` folds them all into "offline", which is right for
+    // a login decision and wrong for a report.
+    let result = match runtime.userinfo.raw.get("error") {
+        Some(serde_json::Value::String(code)) if code == "ok" => StatusResult::Online,
+        Some(serde_json::Value::String(code)) if code == "not_online_error" => {
+            StatusResult::Offline
+        }
+        Some(serde_json::Value::String(code)) => {
+            eprintln!("Unexpected rad_user_info error: {code:?}");
+            return 4;
+        }
+        _ => {
+            eprintln!("Invalid rad_user_info response: missing string error field");
+            return 4;
+        }
+    };
+
+    if args.json {
+        let report = StatusReport {
+            schema_version: STATUS_SCHEMA_VERSION,
+            result: result.as_str(),
+            account: (result == StatusResult::Online).then(|| StatusAccount {
+                username: &runtime.userinfo.username_with_domain,
+                ip: &runtime.user_ip,
+                used_flow_bytes: runtime.userinfo.used_flow,
+                used_time_seconds: runtime.userinfo.used_time,
+                balance: runtime.userinfo.balance,
+                product_name: &runtime.userinfo.product_name,
+            }),
+        };
+        match serde_json::to_string(&report) {
+            Ok(line) => println!("{line}"),
+            Err(err) => {
+                eprintln!("Cannot serialise the status report: {err}");
+                return 4;
+            }
+        }
+        return 0;
+    }
+
+    match result {
+        StatusResult::Online => show_account_info(&runtime),
+        StatusResult::Offline => println!("Offline."),
+    }
+    0
+}
+
+/// The one value `--json` promises a reader: bumping it means a field changed
+/// meaning or disappeared.
+const STATUS_SCHEMA_VERSION: u8 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusResult {
+    Online,
+    Offline,
+}
+
+impl StatusResult {
+    fn as_str(self) -> &'static str {
+        match self {
+            StatusResult::Online => "online",
+            StatusResult::Offline => "offline",
+        }
+    }
+}
+
+/// The `--json` document. Borrowing keeps the account strings where the runtime
+/// already holds them, and `raw` is deliberately absent: it is the whole portal
+/// answer, not a field this command promises.
+#[derive(serde::Serialize)]
+struct StatusReport<'a> {
+    schema_version: u8,
+    result: &'static str,
+    account: Option<StatusAccount<'a>>,
+}
+
+#[derive(serde::Serialize)]
+struct StatusAccount<'a> {
+    username: &'a str,
+    ip: &'a str,
+    used_flow_bytes: i64,
+    used_time_seconds: i64,
+    balance: i64,
+    product_name: &'a str,
+}
+
+/// The last value given for a setting option, which is the one a repeated
+/// option means (`--timeout-ms 1000 --timeout-ms 2000` is 2000).
+fn last_setting_option<'a>(args: &'a Args, key: &str) -> Option<&'a str> {
+    args.setting_options
+        .iter()
+        .rev()
+        .find(|(option_key, _)| option_key == key)
+        .map(|(_, value)| value.as_str())
 }
 
 fn set_pause(control: &ControlDir, paused: bool) -> Result<(), i32> {

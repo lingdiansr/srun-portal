@@ -23,6 +23,7 @@ pub(super) struct Args {
 enum HelpTopic {
     Global,
     Reconnect,
+    Status,
     Disconnect,
     Resume,
     Service,
@@ -48,6 +49,7 @@ enum HelpTopic {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Command {
     Reconnect,
+    Status,
     Disconnect,
     Resume,
     Service(ServiceAction),
@@ -97,7 +99,7 @@ pub(super) enum CredentialsAction {
 }
 
 pub(super) const USAGE: &str = r#"Usage: srun-portal [options] [portal-url]
-       srun-portal [options] reconnect|disconnect|resume
+       srun-portal [options] reconnect|status|disconnect|resume
        srun-portal [options] service install|uninstall|status|start|stop|restart|logs
        srun-portal [options] config show|list|set|unset|validate
        srun-portal [options] credentials set|forget|status
@@ -119,6 +121,7 @@ Service install only:
 
 Commands:
   reconnect              check the connection once and log in when needed
+  status                 report whether this device is online, and the account panel
   disconnect             pause the background task and sign out
   resume                 clear the pause and check the connection now
   service install        install the background reconnect task for this system
@@ -197,6 +200,10 @@ pub(super) fn parse(argv: &[String]) -> Result<Args, String> {
 
         if args.command.is_none() && arg == "reconnect" {
             args.command = Some(Command::Reconnect);
+            continue;
+        }
+        if args.command.is_none() && arg == "status" {
+            args.command = Some(Command::Status);
             continue;
         }
         if args.command.is_none() && arg == "disconnect" {
@@ -470,9 +477,23 @@ fn validate(args: &Args) -> Result<(), String> {
                 .to_string(),
         );
     }
+    // `status` reads the URL the way a GUI supplies it: one explicit option, so a
+    // positional URL that a command already made ambiguous is refused instead of
+    // silently ignored.
+    if args.command == Some(Command::Status) {
+        if args.portal_url.is_some() {
+            return Err(
+                "status does not take a positional portal URL: use --portal-url".to_string(),
+            );
+        }
+        if args.control_dir.is_some() {
+            return Err("--control-dir is not valid for status".to_string());
+        }
+    }
     let supports_json = matches!(
         args.command,
         Some(Command::Reconnect)
+            | Some(Command::Status)
             | Some(Command::Disconnect)
             | Some(Command::Resume)
             | Some(Command::Service(
@@ -489,7 +510,9 @@ fn validate(args: &Args) -> Result<(), String> {
     }
     if !matches!(
         args.command,
-        None | Some(Command::Reconnect) | Some(Command::Service(ServiceAction::Install))
+        None | Some(Command::Reconnect)
+            | Some(Command::Status)
+            | Some(Command::Service(ServiceAction::Install))
     ) {
         return Err("setting options are not valid for this command".to_string());
     }
@@ -498,14 +521,15 @@ fn validate(args: &Args) -> Result<(), String> {
             None | Some(Command::Reconnect) => {
                 matches!(key.as_str(), "portal_url" | "username" | "timeout_ms")
             }
+            Some(Command::Status) => matches!(key.as_str(), "portal_url" | "timeout_ms"),
             Some(Command::Service(ServiceAction::Install)) => true,
             _ => unreachable!("guarded above"),
         };
         if !allowed {
-            let mode = if args.command.is_none() {
-                "interactive mode"
-            } else {
-                "reconnect"
+            let mode = match args.command {
+                None => "interactive mode",
+                Some(Command::Status) => "status",
+                _ => "reconnect",
             };
             return Err(format!(
                 "--{} is not valid for {mode}",
@@ -522,6 +546,7 @@ fn selected_help_topic(args: &Args) -> HelpTopic {
     }
     match &args.command {
         Some(Command::Reconnect) => HelpTopic::Reconnect,
+        Some(Command::Status) => HelpTopic::Status,
         Some(Command::Disconnect) => HelpTopic::Disconnect,
         Some(Command::Resume) => HelpTopic::Resume,
         Some(Command::Service(ServiceAction::Install)) => HelpTopic::ServiceInstall,
@@ -569,6 +594,44 @@ Options:
   --portable        prefer the portable configuration location
   --json            machine-readable output
   --help, -h        print this help and exit
+"#
+        }
+        HelpTopic::Status => {
+            r#"Usage: srun-portal [options] status [--portal-url URL] [--timeout-ms MS] [--json]
+
+Report whether this device is online right now, and the account panel when it
+is. This command is read-only: it fetches the portal configuration page, then
+asks the portal about this device's address once. It never authenticates, never
+signs out, never retries, and does not read the stored password, the control
+directory, the pause state or the event history.
+
+Because nothing is written, `status` neither takes nor waits for the operation
+lock and is unaffected by a pause from `disconnect`/`service stop`.
+
+Online/offline is the portal's own answer for this device: `ok` is online and
+`not_online_error` is offline. Any other answer is a failure, not an offline
+device. The account comes from `rad_user_info` for this machine's address, so it
+reports the session the portal attributes to this device.
+
+The portal URL is `--portal-url`, then the merged configuration; the account is
+not needed and is not read. Either URL form the portal publishes works,
+including a `/srun_portal_success?...` page: only its origin and `ac_id` are
+used, and that page is never requested.
+
+Fields: username (`user_name@domain`), ip, used_flow_bytes (`sum_bytes`),
+used_time_seconds (`sum_seconds`), balance (`user_balance`, the panel's currency
+number, not converted), product_name (`products_name`). Counts are integers in
+their native unit: bytes and seconds.
+
+Output: `--json` prints one line, {schema_version, result, account}, where
+result is "online" or "offline" and account is null unless online. Without
+`--json`, online prints the account panel and offline prints `Offline.`.
+
+Exit status:
+  0   online or offline; the answer was obtained
+  2   bad options or unusable configuration; no request was sent
+  4   the query failed; nothing was printed on stdout
+Diagnostics go to stderr only.
 "#
         }
         HelpTopic::Disconnect => {
@@ -1032,5 +1095,79 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(args.setting_options.len(), 3);
+    }
+
+    #[test]
+    fn status_is_a_command_with_its_own_settings() {
+        for argv in [
+            strings(&["status"]),
+            strings(&["status", "--json"]),
+            strings(&["--json", "status"]),
+            strings(&[
+                "status",
+                "--portal-url",
+                "https://h/srun_portal_success?ac_id=12",
+            ]),
+            strings(&["--portal-url=https://h/srun_portal_pc?ac_id=1", "status"]),
+            strings(&["status", "--timeout-ms=3000"]),
+            strings(&["--timeout-ms", "3000", "status"]),
+        ] {
+            assert_eq!(
+                parse(&argv).unwrap().command,
+                Some(Command::Status),
+                "{argv:?}"
+            );
+        }
+        assert_eq!(
+            parse(&strings(&["status", "--timeout-ms", "3000"]))
+                .unwrap()
+                .setting_options,
+            vec![("timeout_ms".to_string(), "3000".to_string())]
+        );
+        assert_eq!(
+            parse(&strings(&["status", "--json"])).unwrap().help_topic,
+            None
+        );
+        assert!(parse(&strings(&["status", "--json"])).unwrap().json);
+    }
+
+    #[test]
+    fn status_rejects_what_it_does_not_use() {
+        let args = parse(&strings(&["status", "--username", "alice"])).unwrap_err();
+        assert_eq!(args, "--username is not valid for status");
+        // A URL given before the command becomes the positional one, which this
+        // command never reads.
+        assert_eq!(
+            parse(&strings(&["https://h/srun_portal_pc?ac_id=1", "status"])).unwrap_err(),
+            "status does not take a positional portal URL: use --portal-url"
+        );
+        assert_eq!(
+            parse(&strings(&["status", "--reconnect-interval-secs", "60"])).unwrap_err(),
+            "--reconnect-interval-secs is not valid for status"
+        );
+        assert_eq!(
+            parse(&strings(&["status", "--control-dir", "/tmp/state"])).unwrap_err(),
+            "--control-dir is not valid for status"
+        );
+        // The command still takes no positional value of its own.
+        assert_eq!(
+            parse(&strings(&["status", "extra"])).unwrap_err(),
+            "Unexpected argument: extra"
+        );
+    }
+
+    #[test]
+    fn every_status_help_request_reaches_the_status_topic() {
+        for argv in [
+            strings(&["status", "--help"]),
+            strings(&["--help", "status"]),
+        ] {
+            let args = parse(&argv).unwrap();
+            assert!(args.help, "{argv:?}");
+            assert!(
+                help_text(&args).starts_with("Usage: srun-portal [options] status"),
+                "{argv:?}"
+            );
+        }
     }
 }
