@@ -728,6 +728,38 @@ pub fn load_source(source: &ConfigSource) -> Result<Loaded, ConfigError> {
     })
 }
 
+/// Parse a portal URL slug and require an http(s) origin.
+///
+/// The one rule `validate` and the read-only commands share: a portal URL that
+/// does not name a web origin cannot be contacted.
+pub(crate) fn parse_http_portal_url(slug: &str) -> Result<config::PortalUrl, ConfigError> {
+    let portal = config::parse_portal_url(slug)
+        .map_err(|err| ConfigError::Invalid(format!("portal_url: {err}")))?;
+    if !(portal.origin.starts_with("http://") || portal.origin.starts_with("https://")) {
+        return Err(ConfigError::Invalid(format!(
+            "portal_url: {} is not an http or https URL",
+            portal.origin
+        )));
+    }
+    Ok(portal)
+}
+
+/// The bounded timeout rule, kept as one function so every caller reports the
+/// same message for the same value.
+pub(crate) fn validate_timeouts(timeouts: Timeouts) -> Result<(), ConfigError> {
+    for (name, value) in [
+        ("timeout_ms", timeouts.connect_ms),
+        ("timeout_ms", timeouts.read_ms),
+    ] {
+        if !(1..=MAX_TIMEOUT_MS).contains(&value) {
+            return Err(ConfigError::Invalid(format!(
+                "{name} must be between 1 and {MAX_TIMEOUT_MS} (got {value})"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Check that the effective settings can actually be used.
 ///
 /// `require_identity` is what the unattended paths ask for: without a portal URL
@@ -737,14 +769,7 @@ pub fn load_source(source: &ConfigSource) -> Result<Loaded, ConfigError> {
 /// `config validate` catches a timeout of zero before a run does.
 pub fn validate(effective: &Effective, require_identity: bool) -> Result<(), ConfigError> {
     if let Some(slug) = effective.portal_url.as_deref() {
-        let portal = config::parse_portal_url(slug)
-            .map_err(|err| ConfigError::Invalid(format!("portal_url: {err}")))?;
-        if !(portal.origin.starts_with("http://") || portal.origin.starts_with("https://")) {
-            return Err(ConfigError::Invalid(format!(
-                "portal_url: {} is not an http or https URL",
-                portal.origin
-            )));
-        }
+        parse_http_portal_url(slug)?;
     }
     if let Some(username) = effective.username.as_deref() {
         if username.trim().is_empty() {
@@ -753,16 +778,7 @@ pub fn validate(effective: &Effective, require_identity: bool) -> Result<(), Con
             ));
         }
     }
-    for (name, value) in [
-        ("timeout_ms", effective.timeouts.connect_ms),
-        ("timeout_ms", effective.timeouts.read_ms),
-    ] {
-        if !(1..=MAX_TIMEOUT_MS).contains(&value) {
-            return Err(ConfigError::Invalid(format!(
-                "{name} must be between 1 and {MAX_TIMEOUT_MS} (got {value})"
-            )));
-        }
-    }
+    validate_timeouts(effective.timeouts)?;
     if let Some(secs) = effective.reconnect_interval_secs {
         if secs > MAX_INTERVAL_SECS {
             return Err(ConfigError::Invalid(format!(
