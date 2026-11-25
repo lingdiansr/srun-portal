@@ -14,7 +14,21 @@ use srun_portal::transport::{self, Endpoints};
 use support::{Behaviour, Stub, IP};
 
 /// The captured login query (SPEC §13.2) for the stub's fixed inputs.
-const EXPECTED_LOGIN_QUERY: &str = "action=login&username=testuser&password=%7BMD5%7D94401f94e5f4eecf2f52ef15389fc664&os=Linux&name=linux&double_stack=0&chksum=5eaddabca3a1435c9c45e18fa255b3a61a1397e8&info=%7BSRBX1%7D1IPGZziAV7Q51Ak77DPQy%2B3T4n3fHXviay76y9%2FgGgyBNqV0INj7BUrtgOboiAMJpLywBA%2F%2F0FJkVyPJIKGZf5HZe5M7TmAEvgrt3110qKZ2oo%2FTMdrVXahgu8%2BXAUQjxegK9v%3D%3D&ac_id=1&ip=10.9.9.9&n=200&type=0&callback=jsonp";
+///
+/// `os`/`name` are the running platform's `os.type()`/`os.platform()` (see
+/// `runtime::Runtime::new`), so the vector differs on each platform and the
+/// rest of the query is what the capture pins down.
+fn expected_login_query() -> String {
+    format!(
+        "action=login&username=testuser&password=%7BMD5%7D94401f94e5f4eecf2f52ef15389fc664\
+         &os={}&name={}&double_stack=0\
+         &chksum=5eaddabca3a1435c9c45e18fa255b3a61a1397e8\
+         &info=%7BSRBX1%7D1IPGZziAV7Q51Ak77DPQy%2B3T4n3fHXviay76y9%2FgGgyBNqV0INj7BUrtgOboiAMJpLywBA%2F%2F0FJkVyPJIKGZf5HZe5M7TmAEvgrt3110qKZ2oo%2FTMdrVXahgu8%2BXAUQjxegK9v%3D%3D\
+         &ac_id=1&ip=10.9.9.9&n=200&type=0&callback=jsonp",
+        srun_portal::sys::os_type(),
+        srun_portal::sys::platform(),
+    )
+}
 
 fn parse_query(query: &str) -> std::collections::HashMap<String, String> {
     support::parse_query(query)
@@ -58,7 +72,7 @@ fn login_flow_carries_the_captured_queries() {
     );
     assert_eq!(
         stub.queries_for("/cgi-bin/srun_portal"),
-        vec![EXPECTED_LOGIN_QUERY.to_string()]
+        vec![expected_login_query()]
     );
     assert_eq!(runtime.username_with_domain(), "testuser");
     assert_eq!(runtime.userinfo.username, "testuser");
@@ -312,7 +326,7 @@ fn reconnect_once_logs_in_when_the_stub_is_offline() {
     assert_eq!(stub.queries_for("/cgi-bin/get_challenge").len(), 1);
     assert_eq!(
         stub.queries_for("/cgi-bin/srun_portal"),
-        vec![EXPECTED_LOGIN_QUERY.to_string()]
+        vec![expected_login_query()]
     );
     assert_eq!(
         stub.last_query_for("/srun_portal_pc").as_deref(),

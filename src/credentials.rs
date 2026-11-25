@@ -648,7 +648,13 @@ mod tests {
     fn a_missing_file_is_no_password() {
         let dir = TempDir::new("missing");
         assert_eq!(
-            resolve("v2:https%3A%2F%2Fh:alice", &dir.file(), None).unwrap(),
+            resolve_with(
+                &Fake::default(),
+                "v2:https%3A%2F%2Fh:alice",
+                &dir.file(),
+                None
+            )
+            .unwrap(),
             None
         );
     }
@@ -663,21 +669,29 @@ mod tests {
         store(staff, "staff-secret", &path, Target::File).unwrap();
         store(student, "student-secret", &path, Target::File).unwrap();
         assert_eq!(
-            resolve(staff, &path, None).unwrap().as_deref(),
+            resolve_with(&Fake::default(), staff, &path, None)
+                .unwrap()
+                .as_deref(),
             Some("staff-secret")
         );
         assert_eq!(
-            resolve(student, &path, None).unwrap().as_deref(),
+            resolve_with(&Fake::default(), student, &path, None)
+                .unwrap()
+                .as_deref(),
             Some("student-secret")
         );
 
         store(staff, "new-staff", &path, Target::File).unwrap();
         assert_eq!(
-            resolve(staff, &path, None).unwrap().as_deref(),
+            resolve_with(&Fake::default(), staff, &path, None)
+                .unwrap()
+                .as_deref(),
             Some("new-staff")
         );
         assert_eq!(
-            resolve(student, &path, None).unwrap().as_deref(),
+            resolve_with(&Fake::default(), student, &path, None)
+                .unwrap()
+                .as_deref(),
             Some("student-secret")
         );
     }
@@ -689,23 +703,29 @@ mod tests {
         let key = "v2:https%3A%2F%2Fh:alice";
         store(key, "stored", &path, Target::File).unwrap();
         assert_eq!(
-            resolve(key, &path, Some("from-env")).unwrap().as_deref(),
+            resolve_with(&Fake::default(), key, &path, Some("from-env"))
+                .unwrap()
+                .as_deref(),
             Some("from-env")
         );
         // An empty variable means "unset", not "an empty password".
         assert_eq!(
-            resolve(key, &path, Some("")).unwrap().as_deref(),
+            resolve_with(&Fake::default(), key, &path, Some(""))
+                .unwrap()
+                .as_deref(),
             Some("stored")
         );
 
         // A corrupt file does not stop the environment password.
         std::fs::write(&path, "passwords = 3\n").unwrap();
         assert_eq!(
-            resolve(key, &path, Some("from-env")).unwrap().as_deref(),
+            resolve_with(&Fake::default(), key, &path, Some("from-env"))
+                .unwrap()
+                .as_deref(),
             Some("from-env")
         );
         assert!(
-            resolve(key, &path, None).is_err(),
+            resolve_with(&Fake::default(), key, &path, None).is_err(),
             "a broken store is reported"
         );
     }
@@ -721,8 +741,16 @@ mod tests {
 
         remove_file_entry(staff, &path).unwrap();
         assert!(path.exists());
-        assert_eq!(resolve(staff, &path, None).unwrap(), None);
-        assert_eq!(resolve(student, &path, None).unwrap().as_deref(), Some("b"));
+        assert_eq!(
+            resolve_with(&Fake::default(), staff, &path, None).unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_with(&Fake::default(), student, &path, None)
+                .unwrap()
+                .as_deref(),
+            Some("b")
+        );
         assert!(remove_file_entry(student, &path).unwrap());
         assert!(!path.exists(), "the last entry takes the file with it");
         assert!(!remove_file_entry(student, &path).unwrap());
@@ -745,8 +773,14 @@ mod tests {
         std::fs::write(&path, "password = \"unowned-secret\"\n").unwrap();
         let key = "v2:https%3A%2F%2Fh:alice";
 
-        assert_eq!(resolve(key, &path, None).unwrap(), None);
-        assert_eq!(status(key, "alice", &path).unwrap(), Status::LegacyUnscoped);
+        assert_eq!(
+            resolve_with(&Fake::default(), key, &path, None).unwrap(),
+            None
+        );
+        assert_eq!(
+            status_with(&Fake::default(), key, "alice", &path).unwrap(),
+            Status::LegacyUnscoped
+        );
 
         // Writing a v2 entry into that file is refused rather than producing a
         // shape the reader rejects.
@@ -769,7 +803,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(forget_legacy("alice@staff", &path).unwrap());
+        assert!(forget_legacy_with(&Fake::default(), "alice@staff", &path).unwrap());
 
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(!text.contains("\"alice@staff\""), "{text}");
@@ -789,7 +823,7 @@ mod tests {
         let path = dir.file();
         std::fs::write(&path, "password = \"unowned\"\nfoo = \"kept\"\n").unwrap();
 
-        assert!(forget_legacy("alice@staff", &path).unwrap());
+        assert!(forget_legacy_with(&Fake::default(), "alice@staff", &path).unwrap());
 
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(!text.contains("unowned"), "{text}");
@@ -804,9 +838,9 @@ mod tests {
         let dir = TempDir::new("legacy-none");
         let path = dir.file();
         store("v2:https%3A%2F%2Fh:alice", "current", &path, Target::File).unwrap();
-        assert!(!forget_legacy("alice@staff", &path).unwrap());
+        assert!(!forget_legacy_with(&Fake::default(), "alice@staff", &path).unwrap());
         assert_eq!(
-            resolve("v2:https%3A%2F%2Fh:alice", &path, None)
+            resolve_with(&Fake::default(), "v2:https%3A%2F%2Fh:alice", &path, None)
                 .unwrap()
                 .as_deref(),
             Some("current")
@@ -825,7 +859,12 @@ mod tests {
 
         store(key, tricky, &path, Target::File).unwrap();
 
-        assert_eq!(resolve(key, &path, None).unwrap().as_deref(), Some(tricky));
+        assert_eq!(
+            resolve_with(&Fake::default(), key, &path, None)
+                .unwrap()
+                .as_deref(),
+            Some(tricky)
+        );
         let parsed: Table = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(parsed["passwords"][key].as_str(), Some(tricky));
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
@@ -862,13 +901,13 @@ mod tests {
             "password = \"legacy\"\n[passwords]\n\"v2:x\" = \"new\"\n",
         ] {
             std::fs::write(&path, body).unwrap();
-            let err = resolve("v2:x", &path, None).unwrap_err();
+            let err = resolve_with(&Fake::default(), "v2:x", &path, None).unwrap_err();
             assert!(
                 err.to_string().contains(&path.display().to_string()),
                 "{err}"
             );
             assert!(matches!(
-                status("v2:x", "alice", &path).unwrap(),
+                status_with(&Fake::default(), "v2:x", "alice", &path).unwrap(),
                 Status::Unavailable { .. }
             ));
         }
@@ -1049,9 +1088,15 @@ mod tests {
         let dir = TempDir::new("status");
         let path = dir.file();
         let key = "v2:https%3A%2F%2Fh:alice";
-        assert_eq!(status(key, "alice", &path).unwrap(), Status::Missing);
+        assert_eq!(
+            status_with(&Fake::default(), key, "alice", &path).unwrap(),
+            Status::Missing
+        );
         store(key, "secret", &path, Target::File).unwrap();
-        assert_eq!(status(key, "alice", &path).unwrap(), Status::File);
+        assert_eq!(
+            status_with(&Fake::default(), key, "alice", &path).unwrap(),
+            Status::File
+        );
     }
 
     #[test]

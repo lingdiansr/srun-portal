@@ -72,22 +72,23 @@ impl Harness {
     /// `service start` have something to act on without registering a real task.
     fn record_installation(&self) {
         std::fs::create_dir_all(self.state()).expect("state directory");
-        let config = self.config.to_string_lossy().replace('\\', "\\\\");
-        std::fs::write(
-            self.state().join("installed.toml"),
-            format!(
-                "version = 1\n\
-                 exe = \"{BIN}\"\n\
-                 interval_secs = 300\n\
-                 effective_interval_secs = 300\n\
-                 boot_delay_secs = 30\n\
-                 owner_id = \"1000\"\n\n\
-                 [source]\n\
-                 layers = [\"{config}\"]\n\
-                 write_path = \"{config}\"\n"
-            ),
-        )
-        .expect("write installed.toml");
+        // Serialise through the same type the program writes, so a Windows path
+        // gets its backslashes escaped instead of producing invalid TOML.
+        let registration = srun_portal::control::Registration {
+            version: 1,
+            exe: PathBuf::from(BIN),
+            source: srun_portal::settings::ConfigSource {
+                layers: vec![self.config.clone()],
+                write_path: self.config.clone(),
+                legacy_path: None,
+            },
+            interval_secs: Some(300),
+            effective_interval_secs: Some(300),
+            boot_delay_secs: Some(30),
+            owner_id: "1000".to_string(),
+        };
+        let text = toml::to_string_pretty(&registration).expect("registration serialises");
+        std::fs::write(self.state().join("installed.toml"), text).expect("write installed.toml");
     }
 
     fn health(&self) -> Value {
